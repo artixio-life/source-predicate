@@ -1,0 +1,13 @@
+requests
+beautifulsoup4
+lxml
+psycopg2-binary
+boto3
+python-dotenv
+selenium
+webdriver-manager
+playwright
+playwright-stealth
+curl_cffi
+Pillow
+openpyxl

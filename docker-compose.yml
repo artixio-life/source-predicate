@@ -1,0 +1,45 @@
+version: '3.8'
+
+# This repo does NOT run its own MinIO/S3 — it reuses the MinIO instance
+# already provisioned for source-information. Point MINIO_ENDPOINT at it:
+#   - If that MinIO's ports (9000/9001) are published on the host, the
+#     default below (http://host.docker.internal:9000) just works.
+#   - If you'd rather join its Docker network directly (so you can address
+#     it as http://minio:9000 without relying on published ports), uncomment
+#     the `networks:` blocks at the bottom and set MINIO_ENDPOINT=http://minio:9000
+#     in your .env. The network name must match the other compose project's
+#     network (commonly "<project-dir-name>_default", e.g. "source-information_default"
+#     — check with `docker network ls`).
+services:
+  crawler:
+    build: .
+    shm_size: '512m'
+    environment:
+      - POSTGRES_HOST=${POSTGRES_HOST:-host.docker.internal}
+      - POSTGRES_PORT=${POSTGRES_PORT:-5432}
+      - POSTGRES_DB=${POSTGRES_DB:-postgres}
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-postgres}
+      - MINIO_ENDPOINT=${MINIO_ENDPOINT:-http://host.docker.internal:9000}
+      - MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY:-minioadmin}
+      - MINIO_SECRET_KEY=${MINIO_SECRET_KEY:-minioadmin}
+      - MINIO_BUCKET=${MINIO_BUCKET:-drug-predicate-documents}
+      - USE_SSL=${USE_SSL:-False}
+      # Test mode settings (set TEST_MODE=false for production)
+      - TEST_MODE=${TEST_MODE:-true}
+      - TEST_COUNTRIES=${TEST_COUNTRIES:-China}
+      - SKIP_COUNTRIES=${SKIP_COUNTRIES:-}
+      - MAX_RECORDS_PER_COUNTRY=${MAX_RECORDS_PER_COUNTRY:-0}
+      - MAX_SKIPPED_RECORDS_PER_COUNTRY=${MAX_SKIPPED_RECORDS_PER_COUNTRY:-200}
+      - MAX_WORKERS=${MAX_WORKERS:-2}
+      - DOWNLOAD_DOCUMENTS=${DOWNLOAD_DOCUMENTS:-true}
+    # volumes:
+    #   - ./debug:/app/debug
+    # networks:
+    #   - default
+    #   - source_information_shared
+
+# networks:
+#   source_information_shared:
+#     external: true
+#     name: source-information_default
