@@ -57,6 +57,11 @@ Two-step data flow
    Medicine Info documents (~10,300 rows, the "Registered" prescription
    subset) use some other URL not yet identified — not fetched here.
 
+   Fetched with a `ThreadPoolExecutor` (`TGA_DETAIL_WORKERS`, default 10)
+   since this is ~34k independent request+upload pairs with no shared
+   browser/session state — doing them one at a time was the crawl's main
+   bottleneck.
+
 Row -> record mapping
 ----------------------
 The export is a denormalized table: one ARTG ID can span multiple rows
@@ -86,6 +91,7 @@ import logging
 import os
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional
 
 import openpyxl
@@ -113,6 +119,7 @@ SETTLE_MS = 9_000       # this Power BI report is slow to render after navigatio
 SHORT_SETTLE_MS = 1_200
 EXPORT_TIMEOUT_MS = 150_000  # confirmed live: the async export can take ~a minute for 34k+ rows
 REQUEST_TIMEOUT = 30
+DETAIL_WORKERS = int(os.getenv('TGA_DETAIL_WORKERS', '10'))  # per-record step is PDF fetch + S3 upload, no shared browser
 
 # Fields that are the same for every row sharing an ARTG ID.
 _PRODUCT_LEVEL_FIELDS = {
@@ -230,21 +237,36 @@ class AustraliaTGACrawler:
 
         logger.info(f"[TGA ARTG] Parsed {len(records)} unique ARTG products from export")
 
-        saved = 0
-        for artg_id, record in records.items():
-            if check_record_exists_by_json_field(country_id, 'artg_id', artg_id):
-                continue
-            try:
-                if self._process_record(country_id, artg_id, record):
-                    saved += 1
-            except CountrySkipThresholdReached:
-                raise
-            except Exception:
-                logger.exception(f"Failed to process ARTG record {artg_id}")
+        pending = [
+            (artg_id, record) for artg_id, record in records.items()
+            if not check_record_exists_by_json_field(country_id, 'artg_id', artg_id)
+        ]
+        logger.info(f"[TGA ARTG] {len(pending)} new products to process (of {len(records)})")
 
-            if MAX_RECORDS_PER_COUNTRY and saved >= MAX_RECORDS_PER_COUNTRY:
-                logger.info(f"Reached MAX_RECORDS_PER_COUNTRY={MAX_RECORDS_PER_COUNTRY}, stopping.")
-                return
+        saved = 0
+        with ThreadPoolExecutor(max_workers=DETAIL_WORKERS) as pool:
+            futures = {
+                pool.submit(self._process_record, country_id, artg_id, record): artg_id
+                for artg_id, record in pending
+            }
+            for future in as_completed(futures):
+                artg_id = futures[future]
+                try:
+                    if future.result():
+                        saved += 1
+                except CountrySkipThresholdReached:
+                    pool.shutdown(wait=False, cancel_futures=True)
+                    raise
+                except Exception:
+                    logger.exception(f"Failed to process ARTG record {artg_id}")
+
+                if MAX_RECORDS_PER_COUNTRY and saved >= MAX_RECORDS_PER_COUNTRY:
+                    logger.info(f"Reached MAX_RECORDS_PER_COUNTRY={MAX_RECORDS_PER_COUNTRY}, stopping.")
+                    # See the South Africa crawler for why futures must be
+                    # cancelled explicitly rather than relying on the `with`
+                    # block's implicit shutdown(wait=True).
+                    pool.shutdown(wait=False, cancel_futures=True)
+                    break
 
         logger.info(f"TGA ARTG crawl finished. Saved/updated {saved} records.")
 
