@@ -180,6 +180,56 @@ string `"Old Medicine"` for many legacy entries — not unique) nor `name`
 (distinct registrations, sometimes different applicants/eras, can share a
 display name) work as a dedup key here.
 
+## Brazil Crawler — ANVISA Medicamentos
+
+`consultas.anvisa.gov.br` is an AngularJS SPA on a plain REST/JSON backend
+(`app/crawlers/brazil/crawler_br_1.py`) — confirmed live via network
+traffic, no HTML scraping needed:
+
+- **Listing**: `GET /api/consulta/medicamento/produtos/` (DataTables-style
+  `count`/`page` paging, filtered to `checkNotificado=false&checkRegistrado=true`
+  — the same scope as the site's own default listing). ~32,653 products as
+  of 2026-08.
+- **Detail**: `GET /api/consulta/medicamento/produtos/codigo/<codigo>` —
+  full structured record (company, process, every apresentação/registration,
+  labeling-PDF metadata, and an `existeBula` flag).
+- **Bulário + PDF**: for products with `existeBula: true`,
+  `GET /api/consulta/bulario?filter[numeroRegistro]=...` returns a
+  short-lived (~5 min) token, immediately exchanged via
+  `GET /api/consulta/medicamentos/arquivo/bula/parecer/<token>/` for the
+  **Bula do Profissional** (professional package insert) PDF — the only
+  document this crawler downloads (the patient-leaflet PDF and the
+  labeling PDFs are recorded as metadata only, already present in the raw
+  detail response).
+
+Every endpoint requires an `Authorization: Guest` header (confirmed live:
+omitting it returns HTTP 500 `mensagens.MSG-004`).
+
+**Cloudflare, and why this crawler does NOT use FlareSolverr:** confirmed
+live that plain `requests` and `curl_cffi` (Chrome TLS/JA3 impersonation)
+are both hard-blocked by Cloudflare's WAF, even replaying cookies from a
+solved FlareSolverr session — but Playwright's own headless Chromium
+passes cleanly on every endpoint above with no extra work. FlareSolverr
+just runs another browser to solve the same challenge, so it would add a
+service dependency for no benefit here (unlike `source-information`'s
+separate Brazil crawler, a different ANVISA property — a Plone CMS under
+`www.gov.br/anvisa` — which does need it).
+
+**The real constraint is a Cloudflare rate-limit rule**, not the WAF:
+bursting above ~25-30 requests trips a genuine `429` with
+`Retry-After: 600` (a 10-minute penalty), confirmed live and reproducible
+regardless of client. So this crawler runs strictly single-lane (no
+concurrency), pacing every API call (`ANVISA_REQUEST_DELAY_SECONDS`,
+default `1.2`s) and sleeping for the exact `Retry-After` duration on a 429
+rather than guessing at backoff. A full crawl of ~32k products
+necessarily takes several hours; reruns are cheap afterwards since
+already-ingested products are skipped via dedup.
+
+Dedup is by `json_data.codigo_produto` (ANVISA's own per-product id) via
+`app.db.check_record_exists_by_json_field` — most products have no
+downloaded PDF (no bulário entry), so `document_url` can't serve as the
+dedup key the way it does for the UK/Australia crawlers.
+
 ## Crawler Interface
 
 Every crawler class registered in `app/crawlers/<country>/__init__.py` must implement:
