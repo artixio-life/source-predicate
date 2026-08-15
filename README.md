@@ -112,6 +112,14 @@ navigation:
 /substance-index/?letter=<A-Z,0-9>  →  /substance/?substance=<strain>  →  /product/?product=<name>
 ```
 
+Link discovery (letters → strains → unique product links) runs on one
+browser page, sequentially — a couple thousand navigations at most. Product
+pages are the actual bottleneck (tens of thousands of them), so they're
+processed by `MHRA_BROWSER_WORKERS` (default `4`) independent headless
+Chromium instances draining a shared queue concurrently — Playwright's sync
+API ties a page to the thread that opened it, so each worker owns its own
+browser rather than sharing one.
+
 For each product page it:
 
 1. Accepts the per-product legal disclaimer gate when present (checks

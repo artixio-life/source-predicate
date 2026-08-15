@@ -8,6 +8,24 @@ Next.js app with no static HTML to scrape with plain requests)
     /substance/?substance=<strain name>  -> list of product links using that strain
     /product/?product=<product name>     -> document list for that product
 
+Two-phase crawl
+---------------
+Phase 1 (`_discover_products`, one browser page, sequential): walks all 36
+letters -> every strain page -> collects every unique `/product/?product=`
+link. This is a couple thousand navigations at most (letters + strains),
+cheap enough to do serially.
+
+Phase 2 (`_process_products_concurrently`): the actual bottleneck — tens of
+thousands of product pages, each a full SPA navigation + disclaimer click +
+doc-card scrape + document downloads. `BROWSER_WORKERS` (env
+`MHRA_BROWSER_WORKERS`, default 4) independent Chromium instances drain a
+shared queue of discovered products concurrently. Playwright's sync API is
+bound to the thread that started it — a `Page` can't be driven from another
+thread — so each worker launches and owns its own browser for its lifetime
+rather than sharing one; this is why phase 1 and each phase-2 worker each
+call `_new_browser_session()` independently instead of reusing a single
+instance-level browser like the old single-page walk did.
+
 Every product page may sit behind a per-product legal disclaimer gate: an
 `input#agree-checkbox` that must be checked before its `button` ("Agree",
 disabled until checked) can be clicked. Once agreed, the SPA renders a
@@ -78,8 +96,11 @@ from __future__ import annotations
 
 import logging
 import os
+import queue
 import re
 import string
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
@@ -120,6 +141,17 @@ NAV_TIMEOUT_MS = 30_000
 SETTLE_MS = 1200
 MAX_DOC_PAGES_PER_PRODUCT = 50   # safety cap: 50 * 10 = 500 docs/product
 REQUEST_TIMEOUT = 30
+
+# Product pages are the bottleneck (tens of thousands of them, each a full
+# SPA navigation + disclaimer click + doc-card scrape + document downloads),
+# while link discovery (letter index + strain pages) is a couple thousand
+# navigations at most. So only the product-processing phase is parallelized.
+# Playwright's sync API is bound to the thread that started it — a Page
+# can't be driven from another thread — so each worker gets its own
+# Chromium instance rather than sharing one. Each instance is a real
+# headless browser process; raise cautiously and size docker-compose's
+# shm_size accordingly (512m was sized for a single instance).
+BROWSER_WORKERS = int(os.getenv('MHRA_BROWSER_WORKERS', '4'))
 
 _DOC_TYPE_ORDER = {'SPC': 0, 'PIL': 1, 'PAR': 2}
 
@@ -189,36 +221,23 @@ class UnitedKingdomMHRACrawler:
     """Walks the MHRA Products Database via substance-index -> strain -> product navigation."""
 
     def __init__(self):
-        self._playwright = None
-        self._browser = None
-        self._context = None
         self._http = requests.Session()
 
     def close(self):
-        try:
-            if self._context:
-                self._context.close()
-            if self._browser:
-                self._browser.close()
-            if self._playwright:
-                self._playwright.stop()
-        except Exception:
-            logger.debug('Error while closing Playwright browser', exc_info=True)
-        finally:
-            self._context = None
-            self._browser = None
-            self._playwright = None
         self._http.close()
 
-    def _ensure_browser(self):
-        if self._browser is not None:
-            return
-        self._playwright = sync_playwright().start()
-        self._browser = self._playwright.chromium.launch(
+    def _new_browser_session(self):
+        """
+        A standalone Playwright/browser/context/page, independent of any
+        other instance. Used once for link discovery and once per product
+        worker — never shared across threads (see BROWSER_WORKERS above).
+        """
+        pw = sync_playwright().start()
+        browser = pw.chromium.launch(
             headless=True,
             args=['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
         )
-        self._context = self._browser.new_context(
+        context = browser.new_context(
             user_agent=(
                 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
                 'AppleWebKit/537.36 (KHTML, like Gecko) '
@@ -226,18 +245,28 @@ class UnitedKingdomMHRACrawler:
             ),
             viewport={'width': 1366, 'height': 900},
         )
+        page = context.new_page()
+        return pw, browser, context, page
 
     # ------------------------------------------------------------------
     # Top-level crawl
     # ------------------------------------------------------------------
 
     def process_country(self, country_id: int):
-        self._ensure_browser()
-        page = self._context.new_page()
+        pending = self._discover_products()
+        logger.info(f"[UK MHRA] {len(pending)} unique product page(s) to process")
+        saved = self._process_products_concurrently(country_id, pending)
+        logger.info(f"UK MHRA crawl finished. Saved/updated {saved} products "
+                    f"({len(pending)} unique product pages discovered).")
 
+    # ------------------------------------------------------------------
+    # Phase 1: enumerate every unique product link (letter -> strain -> product)
+    # ------------------------------------------------------------------
+
+    def _discover_products(self) -> List[Tuple[str, str]]:
+        pw, browser, context, page = self._new_browser_session()
         seen_products: set = set()
-        saved = 0
-
+        pending: List[Tuple[str, str]] = []
         try:
             for letter in LETTERS:
                 strain_links = self._collect_links(page, f'{BASE_URL}/substance-index/?letter={letter}', '/substance/?substance=')
@@ -246,8 +275,6 @@ class UnitedKingdomMHRACrawler:
                 for strain_href, _strain_text in strain_links:
                     try:
                         product_links = self._collect_links(page, BASE_URL + strain_href, '/product/?product=')
-                    except CountrySkipThresholdReached:
-                        raise
                     except Exception:
                         logger.exception(f"Failed to load strain page: {strain_href}")
                         continue
@@ -256,22 +283,71 @@ class UnitedKingdomMHRACrawler:
                         if product_href in seen_products:
                             continue
                         seen_products.add(product_href)
-
-                        try:
-                            if self._process_product(page, country_id, product_href, product_text):
-                                saved += 1
-                        except CountrySkipThresholdReached:
-                            raise
-                        except Exception:
-                            logger.exception(f"Failed to process product: {product_href}")
-
-                        if MAX_RECORDS_PER_COUNTRY and saved >= MAX_RECORDS_PER_COUNTRY:
-                            logger.info(f"Reached MAX_RECORDS_PER_COUNTRY={MAX_RECORDS_PER_COUNTRY}, stopping.")
-                            return
+                        pending.append((product_href, product_text))
         finally:
-            page.close()
-            logger.info(f"UK MHRA crawl finished. Saved/updated {saved} products "
-                        f"({len(seen_products)} unique product pages visited).")
+            context.close()
+            browser.close()
+            pw.stop()
+        return pending
+
+    # ------------------------------------------------------------------
+    # Phase 2: process every discovered product, BROWSER_WORKERS browser
+    # instances draining a shared queue concurrently
+    # ------------------------------------------------------------------
+
+    def _process_products_concurrently(self, country_id: int, pending: List[Tuple[str, str]]) -> int:
+        work_queue: "queue.Queue[Tuple[str, str]]" = queue.Queue()
+        for item in pending:
+            work_queue.put(item)
+
+        state_lock = threading.Lock()
+        stop_event = threading.Event()
+        state = {'saved': 0, 'error': None}
+
+        def worker():
+            pw, browser, context, page = self._new_browser_session()
+            try:
+                while not stop_event.is_set():
+                    try:
+                        product_href, product_text = work_queue.get_nowait()
+                    except queue.Empty:
+                        return
+
+                    try:
+                        result = self._process_product(page, country_id, product_href, product_text)
+                    except CountrySkipThresholdReached as exc:
+                        with state_lock:
+                            if state['error'] is None:
+                                state['error'] = exc
+                        stop_event.set()
+                        return
+                    except Exception:
+                        logger.exception(f"Failed to process product: {product_href}")
+                        continue
+
+                    if not result:
+                        continue
+
+                    with state_lock:
+                        state['saved'] += 1
+                        hit_limit = MAX_RECORDS_PER_COUNTRY and state['saved'] >= MAX_RECORDS_PER_COUNTRY
+                    if hit_limit:
+                        logger.info(f"Reached MAX_RECORDS_PER_COUNTRY={MAX_RECORDS_PER_COUNTRY}, stopping.")
+                        stop_event.set()
+                        return
+            finally:
+                context.close()
+                browser.close()
+                pw.stop()
+
+        with ThreadPoolExecutor(max_workers=BROWSER_WORKERS) as pool:
+            futures = [pool.submit(worker) for _ in range(BROWSER_WORKERS)]
+            for future in as_completed(futures):
+                future.result()
+
+        if state['error'] is not None:
+            raise state['error']
+        return state['saved']
 
     # ------------------------------------------------------------------
     # Link collection (letter index page, strain page) — both are single-page
