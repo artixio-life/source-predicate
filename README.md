@@ -267,7 +267,7 @@ class SomeCountryCrawler:
 | `TEST_COUNTRIES` | Comma-separated country names | `United Kingdom` |
 | `SKIP_COUNTRIES` | Comma-separated country names to skip (used when `TEST_MODE=false`) | _(empty)_ |
 | `MAX_RECORDS_PER_COUNTRY` | Cap on saved records per run (`0` = unlimited) | `0` |
-| `MAX_SKIPPED_RECORDS_PER_COUNTRY` | Abandon a country early after this many duplicate skips (`0` = disable) | `200` |
+| `MAX_SKIPPED_RECORDS_PER_COUNTRY` | Abandon a country early after this many duplicate skips (`0` = disabled, the default) | `0` |
 | `MAX_WORKERS` | Parallel country-crawler workers | `2` |
 | `DOWNLOAD_DOCUMENTS` | Download + upload source documents to S3 (`false` = metadata only) | `true` |
 
@@ -327,4 +327,4 @@ python -m app.crawlers.united_kingdom.crawler_uk_1
 | **Crawler can't connect to DB** | Check `POSTGRES_HOST` — `host.docker.internal` from Docker, `localhost` for local dev. |
 | **MinIO upload fails** | Verify `MINIO_ENDPOINT` points at the running `source-information` MinIO and the credentials match. The bucket is auto-created if missing. |
 | **"No crawler available"** | Ensure the country has a package under `app/crawlers/` with `COUNTRY_CRAWLER` defined. |
-| **Country skipped too early** | Increase `MAX_SKIPPED_RECORDS_PER_COUNTRY` or set to `0` to disable the skip-counter. |
+| **Country skipped too early** | The skip-counter is disabled by default (`MAX_SKIPPED_RECORDS_PER_COUNTRY=0`). If it is set above `0` in your environment, a country can stop early on a run of duplicates — regulatory feeds are not date-ordered, so this is usually not what you want. |

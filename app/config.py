@@ -22,8 +22,10 @@ SKIP_COUNTRIES = [c.strip() for c in os.getenv('SKIP_COUNTRIES', '').split(',') 
 MAX_RECORDS_PER_COUNTRY = int(os.getenv('MAX_RECORDS_PER_COUNTRY', '0'))
 
 # Maximum number of duplicate-skipped records before abandoning a country
-# early for this run (default: 200; set 0 to disable)
-MAX_SKIPPED_RECORDS_PER_COUNTRY = int(os.getenv('MAX_SKIPPED_RECORDS_PER_COUNTRY', '200'))
+# early for this run (default: 0 = disabled).
+# Disabled by default because regulatory feeds are not ordered by date, so a
+# run of duplicates says nothing about whether new records remain further in.
+MAX_SKIPPED_RECORDS_PER_COUNTRY = int(os.getenv('MAX_SKIPPED_RECORDS_PER_COUNTRY', '0'))
 
 # Maximum number of parallel country-crawler workers
 MAX_WORKERS = int(os.getenv('MAX_WORKERS', '2'))
