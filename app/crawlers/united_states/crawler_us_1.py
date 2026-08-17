@@ -19,6 +19,21 @@ link, unlike MHRA's 36 individual letters/digits). Collects every unique
 ApplNo into a dict, deduped globally (the same application can't reappear
 under a different letter in practice, but a plain dict makes that free).
 
+Confirmed live: firing all 27 letter requests back-to-back with zero delay
+(the crawler's old behavior) reliably trips accessdata.fda.gov's Akamai
+abuse-detection rule — every request gets redirected to
+`/apology_objects/abuse-detection-apology.html` (served with a 404), and
+since that used to be treated as a terminal failure with no retry, one
+flagged session lost every remaining letter page for the rest of the run.
+Plain `requests` itself is NOT the problem — a fresh session sailed through
+all 27 pages fine when paced like a normal browsing session; a small
+jittered delay between letter requests (`LETTER_DELAY_SECONDS`, env
+`FDA_LETTER_DELAY_SECONDS`, default 2s) plus real backoff-and-retry on an
+apology-page response (see `_fetch_html`) is what actually fixes this —
+switching to a headless browser makes it worse, since Akamai here detects
+and blocks headless Chromium's automation fingerprint on the very first
+request, before a plain `requests` call is even flagged.
+
 Confirmed live: the big per-letter drug list uses a client-side pagination
 plugin (`footable`, `data-page-size="100"`) that only hides rows with
 JS/CSS after the page loads — every row for the whole letter (checked
@@ -84,6 +99,7 @@ from __future__ import annotations
 
 import logging
 import os
+import random
 import re
 import string
 import time
@@ -123,6 +139,12 @@ LETTERS = (
 # — the same pattern already used by the South Africa crawler's DETAIL_WORKERS.
 WORKERS = int(os.getenv('FDA_WORKERS', '8'))
 REQUEST_TIMEOUT = 30
+
+# Jittered pause between the 27 sequential letter-page requests in phase 1
+# (see _discover_applications) — keeps the crawl from looking like a burst
+# of 27 identical requests with no delay, which is what tripped Akamai's
+# abuse-detection rule (accessdata.fda.gov/apology_objects/...).
+LETTER_DELAY_SECONDS = float(os.getenv('FDA_LETTER_DELAY_SECONDS', '2'))
 
 _APPL_TYPE_RE = re.compile(r'(ANDA|NDA|BLA)\s*#?\s*\d+')
 _APPL_TYPE_CODE_RE = re.compile(r'\(([A-Z]+)\)')
@@ -241,7 +263,15 @@ class UnitedStatesFDACrawler:
 
     def _discover_applications(self) -> Dict[str, dict]:
         applications: Dict[str, dict] = {}
-        for letter in LETTERS:
+        for i, letter in enumerate(LETTERS):
+            if i > 0:
+                # Confirmed live: hammering all 27 letter pages back-to-back
+                # with zero delay (previously ~70ms apart) is exactly the
+                # kind of non-human cadence Akamai's abuse-detection rule
+                # flags — a small jittered pause between requests makes the
+                # crawl look like a normal browsing session.
+                time.sleep(LETTER_DELAY_SECONDS + random.uniform(0, 1.5))
+
             html = self._fetch_html(LETTER_URL.format(letter=letter))
             if not html:
                 logger.warning(f"[FDA] Failed to fetch letter page: {letter}")
@@ -409,7 +439,14 @@ class UnitedStatesFDACrawler:
     # ------------------------------------------------------------------
 
     def _fetch_html(self, url: str) -> Optional[str]:
-        for attempt in range(3):
+        # A higher attempt budget than the generic 5xx/network-error path
+        # below: the Akamai abuse-detection block (see module docstring) is
+        # a soft, temporary per-session flag that clears after a cooldown,
+        # not a hard ban — worth waiting out rather than giving up after one
+        # try, which is what the crawler used to do (no retry at all for a
+        # 404, so a single flagged session lost every remaining letter page
+        # in ~70ms each with no pause).
+        for attempt in range(6):
             try:
                 resp = self._session.get(url, timeout=REQUEST_TIMEOUT)
             except requests.RequestException as exc:
@@ -419,9 +456,14 @@ class UnitedStatesFDACrawler:
 
             if resp.status_code == 200:
                 return resp.text
-            if resp.status_code in (429, 502, 503, 504):
-                wait = 5 * (attempt + 1)
-                logger.warning(f"FDA returned HTTP {resp.status_code} for {url}, waiting {wait}s")
+
+            is_apology = 'apology_objects' in resp.url
+            if is_apology or resp.status_code in (429, 502, 503, 504):
+                wait = 20 * (attempt + 1) if is_apology else 5 * (attempt + 1)
+                logger.warning(
+                    f"FDA {'served the Akamai abuse-detection apology page' if is_apology else f'returned HTTP {resp.status_code}'} "
+                    f"for {url}, waiting {wait}s (attempt {attempt + 1}/6)"
+                )
                 time.sleep(wait)
                 continue
 
