@@ -13,3 +13,7 @@ services:
       - MINIO_BUCKET=${MINIO_BUCKET:-drug-predicate-documents}
       - TEST_MODE=${TEST_MODE:-false}
       - MAX_RECORDS_PER_COUNTRY=${MAX_RECORDS_PER_COUNTRY:-0}
+    volumes:
+      # Caches the FDA bulk-data zip so repeated runs don't re-download it
+      # (which trips www.fda.gov's abuse detection). See the README.
+      - ./.cache:/app/.cache

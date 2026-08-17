@@ -232,53 +232,112 @@ dedup key the way it does for the UK/Australia crawlers.
 
 ## United States Crawler — Drugs@FDA
 
-`accessdata.fda.gov` is a plain server-rendered ColdFusion app — no browser
-needed, unlike the UK crawler
-(`app/crawlers/united_states/crawler_us_1.py` uses plain `requests` +
-BeautifulSoup):
+This crawler does **not** scrape the Drugs@FDA web UI. It ingests FDA's
+official bulk data files — one download per run instead of ~30k page
+fetches (`app/crawlers/united_states/crawler_us_1.py`):
 
 ```
-/scripts/cder/daf/index.cfm?event=browseByLetter.page&productLetter=<A-Z,0-9>
-    -> /scripts/cder/daf/index.cfm?event=overview.process&ApplNo=<n>
+https://www.fda.gov/media/89850/download   (~6 MB zip, 12 tab-delimited files)
 ```
 
-- **Discovery** (27 letter pages: A-Z plus a single `0-9` bucket — confirmed
-  live, FDA groups all digits into one nav link, unlike MHRA's 36
-  individual letters/digits): every accordion drug-name section on a
-  letter page already lists every ANDA/NDA/BLA application link for that
-  name directly in the initial HTML. Confirmed live: the big per-letter
-  list uses a client-side pagination plugin (`footable`) that only hides
-  rows after the page loads — every row is already present in one GET
-  response, so no pagination handling is needed.
-- **Detail**: `event=overview.process&ApplNo=<n>` — application
-  type/number/company plus four fixed-id tables (`exampleProd`,
-  `exampleApplOrig`/`exampleApplSuppl`, `exampleLabels`) and zero or more
-  `exampleTEVA*` therapeutic-equivalents tables, all parsed generically via
-  `<thead>` th text -> snake_case key. Confirmed live across NDA, ANDA, and
-  BLA applications (e.g. ApplNo 020892, 060002, 761235) that older
-  applications can be missing every table except `exampleProd`.
+**Why not scrape `accessdata.fda.gov`.** It used to walk 27 browse-by-letter
+pages plus one overview page per application. That host now sits behind
+Akamai bot/abuse detection and is confirmed live to be unusable from a
+datacenter IP: from a residential/office IP plain `requests` fetched all 27
+letter pages with HTTP 200, but from the production cluster's egress IP the
+*first* request of the run (letter "A", attempt 1, nothing preceding it) is
+already redirected to `/apology_objects/abuse-detection-apology.html`,
+served with a 404. Because the block lands on request #1 with no prior
+traffic it is not a rate limit — pacing, jitter and backoff were all tried
+and none help. Driving headless Chromium is strictly worse: Akamai detects
+and blocks its automation fingerprint on the very first request, even from
+an IP where plain `requests` passes. The bulk files live on `www.fda.gov`
+instead, and one fetch per run replaces ~30k, shrinking the bot-detection
+surface to a single request. It does not remove it: `www.fda.gov` runs its
+own Akamai abuse detection, and pulling the zip several times in quick
+succession trips it (confirmed live — the block arrives as a 404 redirect to
+the apology page and clears after a cooldown, while `accessdata.fda.gov`
+kept serving the same IP normally). `_fetch_bulk_zip` therefore retries that
+block with backoff instead of treating the 404 as terminal, which is what
+`download_with_retries` would do; tune with `FDA_BULK_ATTEMPTS` /
+`FDA_BULK_BACKOFF_SECONDS`.
 
-**Only PDFs are downloaded.** Every document link on an overview page is
-collected in one page-wide anchor scan (deduped by href — the same label
-PDF is often linked from both the approval-history table and the dedicated
-"Labels for ..." table), but only links that actually end in `.pdf` are
-fetched and mirrored to S3; a Review link that points at an `.html` page,
-or an application with "Label is not available on this site.", stays as
-plain `source_url` metadata in `json_data` and is never downloaded.
+**The zip is cached on disk, and that matters.** FDA only refreshes this
+file periodically, so re-downloading it every run is pure waste — and a few
+rapid re-downloads while iterating locally is exactly what trips the abuse
+detection above, locking the egress IP out for >20 minutes (observed).
+`docker-compose.yml` mounts `./.cache:/app/.cache` so the cache survives
+container recreation; without that volume every `docker compose up` starts
+from scratch.
 
-One row per ApplNo (an application can bundle several product names — see
-`exampleProd` — so `name` joins every distinct product name found there).
-`document_url` holds OUR S3 keys, never FDA's URLs (see
-`app.storage.upload_file`); each document's original `drugsatfda_docs` URL
-is kept separately at `json_data.documents[i].source_url`.
+Resolution order is **fresh cache → download → stale cache**. That last step
+is deliberate: if the download is blocked but any cached copy exists, the run
+proceeds on it at any age with a loud warning, because FDA's data moves
+slowly enough that a slightly dated dataset beats ingesting nothing.
+Verified live during an actual lockout — the run still ingested all 29,270
+applications from cache. Tune with `FDA_BULK_CACHE_DIR` (default
+`$PWD/.cache/fda`) and `FDA_BULK_CACHE_TTL_SECONDS` (default 24h); delete
+`.cache/fda/drugsfda.zip` to force a refresh.
+
+**File → field mapping** (all confirmed live against the 2026-08-14
+release: 29,270 applications, 51,653 products, 193,466 submissions, 80,824
+document links):
+
+| Bulk file | Replaces |
+|---|---|
+| `Applications.txt` | application type/number/sponsor header |
+| `Products.txt` | the `exampleProd` table |
+| `Submissions.txt` | `exampleApplOrig` / `exampleApplSuppl` (ORIG vs SUPPL) |
+| `ApplicationDocs.txt` | the page-wide `drugsatfda_docs` anchor scan, typed via `ApplicationsDocsType_Lookup` |
+| `TE.txt` | the `exampleTEVA*` therapeutic-equivalents tables |
+| `MarketingStatus.txt` | the "Marketing Status" product column |
+| `Join_Submission_ActionTypes_Lookup.txt` + `ActionTypes_Lookup.txt` | supplement action types (only free text in the HTML) |
+
+**Parsing gotchas** — all four are load-bearing:
+
+1. Encoding is **cp1252, not UTF-8**; `Submissions.txt` and
+   `ApplicationDocs.txt` both contain bytes (0x92, 0xa0) that raise
+   `UnicodeDecodeError` under UTF-8.
+2. The files contain literal unescaped `"` characters inside data fields (5
+   in `Products.txt`, 198 in `Submissions.txt`) that are **not** csv
+   quoting — they must be read with `quoting=csv.QUOTE_NONE`, or the
+   default `QUOTE_MINIMAL` swallows following rows into one giant field.
+3. Exactly one `ApplicationDocs.txt` row has a stray extra tab (9 fields
+   against an 8-column header); `_fit_row` repairs it instead of dropping it.
+4. Join keys need stripping — `SubmissionType` is space-padded (`'SUPPL     '`).
+
+**Only PDFs are downloaded**, unchanged from the scraping version: links
+that don't end in `.pdf` (e.g. a Review pointing at `.html`) stay as
+`source_url`-only metadata. Two guards matter because the document host is
+still the WAF'd `accessdata.fda.gov`: URLs are upgraded to https (the bulk
+file lists many as http), and a body must actually start with `%PDF` before
+upload, so an Akamai block page is never mirrored to S3 under a `.pdf` key.
+If document downloading is blocked from your egress, metadata ingestion
+still succeeds — set `DOWNLOAD_DOCUMENTS=false` to skip it entirely.
+
+One row per ApplNo (an application can bundle several products, so `name`
+joins every distinct `DrugName`). `name` is bounded to the column's
+`VARCHAR(255)` on a whole-product boundary with a `(+N more)` marker —
+confirmed live that 35 of 29,270 applications otherwise exceed it (the longest
+is 4,669 chars). This is not about avoiding an insert error: `save_drug_record`
+already truncates over-long names (`app/db.py:276-278`). It's about where the
+cut lands — that path slices mid-word and logs a warning per record, so a
+clean boundary gives a better name and drops 35 lines of noise per run.
+Nothing is lost either way, since `json_data.products` holds the full list.
+`document_url` holds
+OUR S3 keys, never FDA's URLs (see `app.storage.upload_file`); each
+document's original `drugsatfda_docs` URL is kept at
+`json_data.documents[i].source_url`, and `json_data.source_url` still points
+at the human-readable overview page for provenance (that page is not
+fetched).
 
 Dedup is by `json_data.application_number` (FDA's own ApplNo, stable and
-unique) via `app.db.check_record_exists_by_json_field` — `name` isn't
-usable since many distinct applications share a brand/generic name.
+unique) via `app.db.check_record_exists_by_json_field` — `name` isn't usable
+since many distinct applications share a brand/generic name.
 
-`FDA_WORKERS` (default 8) threads share one `requests.Session` for the
-detail-page fan-out — no browser state to isolate per thread, unlike MHRA,
-so this follows the same pattern as SAHPRA's `DETAIL_WORKERS`.
+`FDA_WORKERS` (default 8) threads persist the parsed applications; the only
+network I/O left in that fan-out is optional PDF downloading.
+`FDA_BULK_ZIP_URL` overrides the download location.
 
 ## Crawler Interface
 
@@ -370,12 +429,13 @@ To run just the UK crawler directly (bypassing `main.py`'s country filtering):
 python -m app.crawlers.united_kingdom.crawler_uk_1
 ```
 
-Same pattern for the FDA crawler (limit to a couple of letters first via
-`FDA_LETTERS=V,0-9` — a full A-Z crawl visits tens of thousands of
-application pages and takes a long time):
+Same pattern for the FDA crawler. It makes a single ~6 MB download and then
+works offline from the parsed bulk files, so discovery is fast; the slow
+part is the optional PDF mirroring, which `MAX_RECORDS_PER_COUNTRY` (or
+`DOWNLOAD_DOCUMENTS=false`) keeps short for a smoke test:
 
 ```bash
-FDA_LETTERS=V python -m app.crawlers.united_states.crawler_us_1
+MAX_RECORDS_PER_COUNTRY=20 python -m app.crawlers.united_states.crawler_us_1
 ```
 
 ## Troubleshooting

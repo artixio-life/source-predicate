@@ -33,6 +33,13 @@ services:
       - MAX_SKIPPED_RECORDS_PER_COUNTRY=${MAX_SKIPPED_RECORDS_PER_COUNTRY:-0}
       - MAX_WORKERS=${MAX_WORKERS:-2}
       - DOWNLOAD_DOCUMENTS=${DOWNLOAD_DOCUMENTS:-true}
+    volumes:
+      # Persists the FDA bulk-data zip across container recreations. Without
+      # this, every `docker compose up` re-downloads it, and a few rapid
+      # rebuilds are enough to trip www.fda.gov's abuse detection and lock
+      # the egress IP out for >20 minutes. See the United States section of
+      # the README.
+      - ./.cache:/app/.cache
     # volumes:
     #   - ./debug:/app/debug
     # networks:
