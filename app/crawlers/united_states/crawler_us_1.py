@@ -425,7 +425,17 @@ class UnitedStatesFDACrawler:
                 time.sleep(wait)
                 continue
 
-            logger.warning(f"FDA returned HTTP {resp.status_code} for {url}")
+            # Log enough to tell a real "not found" apart from a WAF/CDN
+            # block page returning a 404 to avoid revealing itself: the
+            # final URL after any redirect, a couple of infra-identifying
+            # headers, and a short body snippet.
+            snippet = (resp.text or '')[:300].replace('\n', ' ').strip()
+            logger.warning(
+                f"FDA returned HTTP {resp.status_code} for {url} "
+                f"(final_url={resp.url!r}, server={resp.headers.get('Server')!r}, "
+                f"via={resp.headers.get('Via')!r}, cf_ray={resp.headers.get('CF-RAY')!r}): "
+                f"{snippet!r}"
+            )
             return None
         return None
 
