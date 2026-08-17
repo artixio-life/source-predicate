@@ -230,6 +230,56 @@ Dedup is by `json_data.codigo_produto` (ANVISA's own per-product id) via
 downloaded PDF (no bulário entry), so `document_url` can't serve as the
 dedup key the way it does for the UK/Australia crawlers.
 
+## United States Crawler — Drugs@FDA
+
+`accessdata.fda.gov` is a plain server-rendered ColdFusion app — no browser
+needed, unlike the UK crawler
+(`app/crawlers/united_states/crawler_us_1.py` uses plain `requests` +
+BeautifulSoup):
+
+```
+/scripts/cder/daf/index.cfm?event=browseByLetter.page&productLetter=<A-Z,0-9>
+    -> /scripts/cder/daf/index.cfm?event=overview.process&ApplNo=<n>
+```
+
+- **Discovery** (27 letter pages: A-Z plus a single `0-9` bucket — confirmed
+  live, FDA groups all digits into one nav link, unlike MHRA's 36
+  individual letters/digits): every accordion drug-name section on a
+  letter page already lists every ANDA/NDA/BLA application link for that
+  name directly in the initial HTML. Confirmed live: the big per-letter
+  list uses a client-side pagination plugin (`footable`) that only hides
+  rows after the page loads — every row is already present in one GET
+  response, so no pagination handling is needed.
+- **Detail**: `event=overview.process&ApplNo=<n>` — application
+  type/number/company plus four fixed-id tables (`exampleProd`,
+  `exampleApplOrig`/`exampleApplSuppl`, `exampleLabels`) and zero or more
+  `exampleTEVA*` therapeutic-equivalents tables, all parsed generically via
+  `<thead>` th text -> snake_case key. Confirmed live across NDA, ANDA, and
+  BLA applications (e.g. ApplNo 020892, 060002, 761235) that older
+  applications can be missing every table except `exampleProd`.
+
+**Only PDFs are downloaded.** Every document link on an overview page is
+collected in one page-wide anchor scan (deduped by href — the same label
+PDF is often linked from both the approval-history table and the dedicated
+"Labels for ..." table), but only links that actually end in `.pdf` are
+fetched and mirrored to S3; a Review link that points at an `.html` page,
+or an application with "Label is not available on this site.", stays as
+plain `source_url` metadata in `json_data` and is never downloaded.
+
+One row per ApplNo (an application can bundle several product names — see
+`exampleProd` — so `name` joins every distinct product name found there).
+`document_url` holds OUR S3 keys, never FDA's URLs (see
+`app.storage.upload_file`); each document's original `drugsatfda_docs` URL
+is kept separately at `json_data.documents[i].source_url`.
+
+Dedup is by `json_data.application_number` (FDA's own ApplNo, stable and
+unique) via `app.db.check_record_exists_by_json_field` — `name` isn't
+usable since many distinct applications share a brand/generic name.
+
+`FDA_WORKERS` (default 8) threads share one `requests.Session` for the
+detail-page fan-out — no browser state to isolate per thread, unlike MHRA,
+so this follows the same pattern as SAHPRA's `DETAIL_WORKERS`.
+
 ## Crawler Interface
 
 Every crawler class registered in `app/crawlers/<country>/__init__.py` must implement:
@@ -318,6 +368,14 @@ To run just the UK crawler directly (bypassing `main.py`'s country filtering):
 
 ```bash
 python -m app.crawlers.united_kingdom.crawler_uk_1
+```
+
+Same pattern for the FDA crawler (limit to a couple of letters first via
+`FDA_LETTERS=V,0-9` — a full A-Z crawl visits tens of thousands of
+application pages and takes a long time):
+
+```bash
+FDA_LETTERS=V python -m app.crawlers.united_states.crawler_us_1
 ```
 
 ## Troubleshooting
