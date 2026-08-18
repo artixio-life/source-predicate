@@ -601,7 +601,7 @@ class UnitedStatesFDACrawler:
             return None
         return None
 
-    def _fetch_labels(self, appl_no: str) -> Optional[List[dict]]:
+    def _fetch_labels(self, openfda_application_number: str) -> Optional[List[dict]]:
         """
         Fetch every SPL label record openFDA links to this application via
         `openfda.application_number` — an exact-match keyword field on the
@@ -610,21 +610,33 @@ class UnitedStatesFDACrawler:
         later application (a new indication, typically) reused an earlier
         one's already-approved label verbatim.
 
+        `openfda_application_number` MUST be the type-PREFIXED form (e.g.
+        "NDA020695", matching drugsfda.json's own native `application_number`
+        field exactly) — NOT this crawler's internal prefix-stripped,
+        zero-padded `appl_no` (e.g. "020695") used for dedup/storage
+        elsewhere in this file. Confirmed live: querying with the bare form
+        returns a 404 unconditionally, for every application, regardless of
+        whether a real label exists — a real bug caught only by running
+        _process_application end-to-end rather than unit-testing this method
+        with a hand-typed, already-correct argument. See the caller in
+        _process_application for how the prefixed form is reconstructed.
+
         Querying per-application-number here — never enumerating label.json
         globally — means a shared label is fetched once per application it
         belongs to and attached under EACH application's own row. That is
-        correct, not a duplicate: `appl_no` is always one of drugsfda.json's
-        own already-deduped, genuinely distinct application_number values
-        (see _process_application's dedup check), so two applications
-        sharing one label are two real FDA records that happen to reference
-        the same document — both rows are supposed to carry a copy of it.
+        correct, not a duplicate: the caller always passes one of
+        drugsfda.json's own already-deduped, genuinely distinct
+        application_number values (see _process_application's dedup check),
+        so two applications sharing one label are two real FDA records that
+        happen to reference the same document — both rows are supposed to
+        carry a copy of it.
 
         Returns None (not []) on a real fetch failure, so callers can tell
         "we don't know" apart from "confirmed zero labels" (a 404 — see
         _api_get) rather than silently treating a failure as "no labels".
         """
         page = self._api_get(
-            f'openfda.application_number:"{appl_no}"',
+            f'openfda.application_number:"{openfda_application_number}"',
             limit=LABEL_FETCH_LIMIT, skip=0, base_url=LABEL_URL,
         )
         if page is None:
@@ -634,7 +646,7 @@ class UnitedStatesFDACrawler:
         total = (page.get('meta', {}).get('results', {}) or {}).get('total', 0)
         if total > len(results):
             logger.warning(
-                f"[FDA] label lookup for {appl_no} truncated at {len(results)}/{total} "
+                f"[FDA] label lookup for {openfda_application_number} truncated at {len(results)}/{total} "
                 f"(LABEL_FETCH_LIMIT={LABEL_FETCH_LIMIT}) — raise it if this recurs"
             )
         return results
@@ -1135,8 +1147,24 @@ class UnitedStatesFDACrawler:
         # per-application-number rather than bulk-crawled, and why a label
         # shared across more than one application_number is correctly
         # fetched and attached once per application, not a duplicate.
-        spl_labels = self._fetch_labels(appl_no)
-        if spl_labels is None:
+        #
+        # `appl_no` here is OUR internal, prefix-stripped, zero-padded key
+        # (e.g. "020695") — NOT what label.json's own openfda.application_number
+        # field contains, which is always prefixed (e.g. "NDA020695", matching
+        # drugsfda.json's own native application_number exactly, confirmed
+        # live). Searching with the bare form returns a 404 unconditionally,
+        # for every application, regardless of whether a real label exists —
+        # confirmed live this was silently swallowing every match (e.g. a
+        # shared Mekinist-style label) as "no label found". Reconstruct the
+        # prefixed form before calling _fetch_labels; skip the lookup
+        # entirely (rather than searching with a value known to never match)
+        # if application_type_code is missing.
+        openfda_appl_no = (
+            f"{record['application_type_code']}{appl_no}"
+            if record.get('application_type_code') else None
+        )
+        spl_labels = self._fetch_labels(openfda_appl_no) if openfda_appl_no else []
+        if openfda_appl_no and spl_labels is None:
             logger.warning(f"[FDA] Could not fetch openFDA SPL label(s) for {appl_no} "
                             f"— saving the application without them")
             spl_labels = []
