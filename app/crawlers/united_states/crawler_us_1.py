@@ -631,12 +631,27 @@ class UnitedStatesFDACrawler:
             return None
         return None
 
-    def prefetch_labels(self, applications: Dict[str, dict]) -> Dict[str, List[dict]]:
+    def iter_label_batches(self, applications: Dict[str, dict]):
         """
-        Fetch every SPL label for every discovered application in ONE pass,
-        batching many application_numbers into each label.json query —
-        openFDA supports OR-ing multiple values into one `search`, confirmed
-        live (`openfda.application_number:("NDA1" OR "NDA2" OR ...)`).
+        Fetch every SPL label for every discovered application, batching
+        many application_numbers into each label.json query — openFDA
+        supports OR-ing multiple values into one `search`, confirmed live
+        (`openfda.application_number:("NDA1" OR "NDA2" OR ...)`) — and
+        YIELD one batch's results at a time rather than accumulating
+        everything before returning.
+
+        This is a generator specifically so a caller processing a large
+        `applications` set (e.g. the ~29k-application backfill script) can
+        persist each batch immediately and let it be garbage collected
+        before fetching the next, instead of holding every application's
+        full label TEXT (indications, warnings, dosage, adverse reactions —
+        often tens of KB each) in memory simultaneously for the whole run.
+        Confirmed live this matters: holding all ~29k applications' labels
+        at once is enough to threaten OOM in a memory-constrained container
+        (see backfill_labels.py, which consumes this generator directly for
+        exactly that reason). `prefetch_labels` below is a thin
+        accumulating wrapper for callers that only process a small/bounded
+        set and genuinely want everything at once.
 
         This replaced an earlier per-application design (one label.json call
         inside _process_application per application, ~29k calls total) that
@@ -657,15 +672,22 @@ class UnitedStatesFDACrawler:
         number, because a later application reused an earlier one's
         already-approved label verbatim (see _process_application's
         docstring cross-reference). A returned label is indexed under EVERY
-        application_number in its own array that we're looking for —
-        regardless of which batch surfaced it — so a shared label resolves
-        correctly for every application it belongs to, exactly as the old
-        per-application lookup did, just computed once up front instead of
-        redundantly per application.
+        application_number in its own array that we're looking for, so a
+        shared label resolves correctly for every application it belongs
+        to, exactly as the old per-application lookup did, just computed
+        once up front instead of redundantly per application.
 
-        Returns {appl_no: [label, ...]}; an application with no key present
-        had zero labels found (matches the old per-call 404 = "confirmed
-        empty" semantics) — callers should use .get(appl_no, []).
+        Yields (batch_num, total_batches, batch_appl_nos, labels_for_this_batch):
+        `batch_appl_nos` is every internal appl_no this batch's own query
+        targeted (a strict partition across all yields — each appl_no with
+        a type_code appears in exactly one batch, so a caller iterating
+        `batch_appl_nos` across every yield covers every application
+        exactly once). `labels_for_this_batch` is {appl_no: [label, ...]}
+        for whichever of those actually matched — an appl_no present in
+        `batch_appl_nos` but absent from `labels_for_this_batch` had zero
+        labels found (matches the old per-call 404 = "confirmed empty"
+        semantics), which is why callers need `batch_appl_nos` at all
+        rather than just the (possibly sparse) label dict.
         """
         # Map OUR type-prefixed openFDA key (e.g. "NDA020695") back to every
         # internal appl_no (e.g. "020695") it corresponds to — normally one,
@@ -679,7 +701,6 @@ class UnitedStatesFDACrawler:
             if type_code:
                 wanted[f'{type_code}{appl_no}'].append(appl_no)
 
-        labels_by_appl_no: Dict[str, List[dict]] = defaultdict(list)
         openfda_keys = list(wanted.keys())
         total_batches = -(-len(openfda_keys) // LABEL_BATCH_SIZE) if openfda_keys else 0
         logger.info(f"[FDA] Prefetching SPL labels for {len(openfda_keys)} application(s) "
@@ -687,11 +708,17 @@ class UnitedStatesFDACrawler:
 
         for batch_num, i in enumerate(range(0, len(openfda_keys), LABEL_BATCH_SIZE), start=1):
             batch = openfda_keys[i:i + LABEL_BATCH_SIZE]
+            # This batch's own strict partition of appl_no's — see the
+            # docstring on why callers need this, not just the label dict.
+            batch_appl_nos = [appl_no for key in batch for appl_no in wanted[key]]
+            labels_this_batch: Dict[str, List[dict]] = defaultdict(list)
+
             search = 'openfda.application_number:(' + ' OR '.join(f'"{k}"' for k in batch) + ')'
             page = self._api_get(search, limit=LABEL_BATCH_RESULT_LIMIT, skip=0, base_url=LABEL_URL)
             if page is None:
                 logger.warning(f"[FDA] Label batch {batch_num}/{total_batches} failed outright — "
-                               f"{len(batch)} application(s) in it will show no labels")
+                               f"{len(batch_appl_nos)} application(s) in it will show no labels")
+                yield batch_num, total_batches, batch_appl_nos, labels_this_batch
                 continue
 
             results = page.get('results') or []
@@ -706,8 +733,25 @@ class UnitedStatesFDACrawler:
             for label in results:
                 for openfda_appl_no in (label.get('openfda') or {}).get('application_number') or []:
                     for appl_no in wanted.get(openfda_appl_no, ()):
-                        labels_by_appl_no[appl_no].append(label)
+                        labels_this_batch[appl_no].append(label)
 
+            logger.info(f"[FDA] Label batch {batch_num}/{total_batches}: "
+                        f"{len(labels_this_batch)}/{len(batch_appl_nos)} application(s) resolved a label")
+            yield batch_num, total_batches, batch_appl_nos, labels_this_batch
+
+    def prefetch_labels(self, applications: Dict[str, dict]) -> Dict[str, List[dict]]:
+        """
+        Accumulating wrapper over iter_label_batches for callers that
+        process a small/bounded application set and genuinely want
+        everything at once (this crawler's own process_country, which is
+        already holding comparable volumes of per-application data for its
+        other fields). For a large set where peak memory matters, consume
+        iter_label_batches directly instead — see its docstring and
+        backfill_labels.py.
+        """
+        labels_by_appl_no: Dict[str, List[dict]] = {}
+        for _batch_num, _total_batches, _batch_appl_nos, labels_this_batch in self.iter_label_batches(applications):
+            labels_by_appl_no.update(labels_this_batch)
         logger.info(f"[FDA] Prefetched labels for {len(labels_by_appl_no)}/{len(applications)} "
                     f"application(s)")
         return labels_by_appl_no

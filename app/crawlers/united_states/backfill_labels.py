@@ -20,12 +20,23 @@ reason, taking hours; this script instead:
   1. Reads every existing US row's `application_number` and
      `application_type_code` straight out of its OWN already-stored
      json_data — no fresh crawl, no re-parsing drugsfda.json/the TSV.
-  2. Runs them through the same batched `prefetch_labels()` the crawler
-     itself now uses (~100 requests for ~29k applications, not ~29k).
+  2. Runs them through the same batched `iter_label_batches()` the crawler
+     itself now uses (~100 requests for ~29k applications, not ~29k) —
+     consumed as a GENERATOR here, one batch at a time, not accumulated
+     into one big dict first (see below).
   3. UPDATEs ONLY the `json_data.spl_labels` key on each row, via
      Postgres's jsonb `||` merge operator — every other field already in
      json_data (products, documents, approval_history, ...) and the row's
      `document_url`/`name` are left completely untouched.
+
+Memory: confirmed live that a full ~29k-application run holding every
+application's full label TEXT (indications, warnings, dosage, adverse
+reactions — often tens of KB each) in memory at once — i.e. calling the
+crawler's accumulating `prefetch_labels()` instead — is enough to threaten
+OOM in a memory-constrained container. This script instead consumes
+`iter_label_batches()` directly and writes each batch's rows immediately,
+so peak memory stays bounded to one batch (`FDA_LABEL_BATCH_SIZE`
+applications' worth of labels) rather than the whole run.
 
 Every row's application_number is reprocessed unconditionally, not just
 rows missing `spl_labels` — a present-but-empty `spl_labels: []` from a
@@ -127,38 +138,41 @@ def run():
 
     applications = {}
     row_ids_by_appl_no = {}
-    skipped_no_type_code = 0
+    no_type_code_appl_nos = set()
     for row in rows:
         appl_no = row['appl_no']
         if not appl_no:
             continue
         if not row.get('application_type_code'):
-            skipped_no_type_code += 1
+            no_type_code_appl_nos.add(appl_no)
         applications[appl_no] = {'application_type_code': row.get('application_type_code')}
         row_ids_by_appl_no.setdefault(appl_no, []).append(row['id'])
 
-    if skipped_no_type_code:
+    if no_type_code_appl_nos:
         logger.warning(
-            f"[FDA backfill] {skipped_no_type_code} row(s) have no application_type_code in "
-            f"their stored json_data — those can't be searched against openFDA and will get spl_labels=[]"
+            f"[FDA backfill] {len(no_type_code_appl_nos)} application(s) have no "
+            f"application_type_code in their stored json_data — those can't be searched "
+            f"against openFDA and get spl_labels=[] directly, without a lookup"
         )
 
-    crawler = UnitedStatesFDACrawler()
-    try:
-        labels_by_appl_no = crawler.prefetch_labels(applications)
-    finally:
-        crawler.close()
-
+    # Consume iter_label_batches directly (NOT the accumulating
+    # prefetch_labels wrapper) and write each batch's rows immediately —
+    # see the module docstring's "Memory" section for why this matters at
+    # ~29k applications. Peak memory here is bounded to one batch
+    # (FDA_LABEL_BATCH_SIZE applications' worth of labels), not the whole
+    # run — each batch's dict is discarded once its rows are written.
     updated = 0
     failed = 0
     with_labels = 0
-    for appl_no, row_ids in row_ids_by_appl_no.items():
-        spl_labels = labels_by_appl_no.get(appl_no, [])
+    checked = 0
+
+    def _apply(appl_no, spl_labels):
+        nonlocal updated, failed, with_labels
         if spl_labels:
             with_labels += 1
         if DRY_RUN:
-            continue
-        for row_id in row_ids:
+            return
+        for row_id in row_ids_by_appl_no.get(appl_no, ()):
             try:
                 _update_row_spl_labels(country_id, row_id, spl_labels)
                 updated += 1
@@ -166,12 +180,31 @@ def run():
                 failed += 1
                 logger.exception(f"[FDA backfill] Failed to update row id={row_id} (appl_no={appl_no})")
 
+    crawler = UnitedStatesFDACrawler()
+    try:
+        for batch_num, total_batches, batch_appl_nos, labels_this_batch in crawler.iter_label_batches(applications):
+            for appl_no in batch_appl_nos:
+                _apply(appl_no, labels_this_batch.get(appl_no, []))
+            checked += len(batch_appl_nos)
+            logger.info(f"[FDA backfill] Batch {batch_num}/{total_batches} written "
+                        f"({checked}/{len(applications) - len(no_type_code_appl_nos)} application(s) so far)")
+    finally:
+        crawler.close()
+
+    # These never appear in any batch — iter_label_batches can't search for
+    # an application with no type code at all — so they're handled directly
+    # here rather than being silently skipped, giving every row a
+    # definitive spl_labels value.
+    for appl_no in no_type_code_appl_nos:
+        _apply(appl_no, [])
+    checked += len(no_type_code_appl_nos)
+
     logger.info(
         f"[FDA backfill] Done{' (DRY RUN, nothing written)' if DRY_RUN else ''}: "
-        f"{len(applications)} application(s) checked, "
+        f"{checked} application(s) checked, "
         f"{with_labels} resolved at least one spl_label, "
-        f"{len(applications) - with_labels} confirmed empty (no label on file for that application) "
-        + (f"— {updated} row(s) updated, {failed} failed" if not DRY_RUN else "")
+        f"{checked - with_labels} confirmed empty (no label on file for that application)"
+        + (f" — {updated} row(s) updated, {failed} failed" if not DRY_RUN else "")
     )
 
 
