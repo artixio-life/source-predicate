@@ -121,6 +121,30 @@ the TSVs still list many as http), and a downloaded body must start with
 under a .pdf key. If document downloading is blocked from your egress,
 metadata ingestion still succeeds — set DOWNLOAD_DOCUMENTS=false to skip.
 
+SPL label content — the actual label TEXT, not just a PDF link
+-----------------------------------------------------------------
+`json_data.documents`/`label_documents` above are just PDF/document LINKS
+(from drugsfda's submissions, or the TSV's ApplicationDocs.txt) — metadata
+about a file, not its content. `json_data.spl_labels` is different: it's
+openFDA's `api.fda.gov/drug/label.json`, the actual Structured Product
+Labeling TEXT (indications_and_usage, warnings, dosage_and_administration,
+active_ingredient, inactive_ingredient, contraindications, and more, all
+already split into clean fields) fetched per-application via
+`_fetch_labels`. No skip-cap partitioning is needed here (unlike the bulk
+drugsfda discovery above) because each lookup is scoped to one
+application_number and never returns more than a handful of records.
+
+`openfda.application_number` is confirmed live to be an ARRAY on the label
+side: some labels (e.g. trametinib/Mekinist, NDA204114 + NDA217513) list
+MORE THAN ONE application_number, because a later application reused an
+earlier one's already-approved label verbatim. This does NOT create
+duplicate rows: `_fetch_labels` is only ever called with one already-
+deduped, genuinely distinct application_number from drugsfda.json (this
+crawler never enumerates label.json globally), so the shared label is
+fetched independently for each application it belongs to and attached
+under that application's own row — two real FDA applications sharing one
+label document, not one label duplicated.
+
 Dedup is by `json_data.application_number`
 ------------------------------------------
 FDA's own application number (e.g. "020892") is stable and unique — the
@@ -178,6 +202,12 @@ SOURCES = (
 )
 
 API_URL = os.getenv('FDA_API_URL', 'https://api.fda.gov/drug/drugsfda.json')
+# openFDA's SPL label content — the actual label TEXT (indications_and_usage,
+# warnings, dosage_and_administration, active/inactive ingredients, etc.),
+# not just a PDF link. Queried per-application-number (never bulk-crawled),
+# so it never needs skip-cap partitioning — see _fetch_labels.
+LABEL_URL = os.getenv('FDA_LABEL_API_URL', 'https://api.fda.gov/drug/label.json')
+LABEL_FETCH_LIMIT = int(os.getenv('FDA_LABEL_FETCH_LIMIT', '100'))
 OPENFDA_ZIP_URL = os.getenv(
     'FDA_OPENFDA_ZIP_URL',
     'https://download.open.fda.gov/drug/drugsfda/drug-drugsfda-0001-of-0001.json.zip',
@@ -531,11 +561,11 @@ class UnitedStatesFDACrawler:
     # Source 1: the openFDA query API
     # ------------------------------------------------------------------
 
-    def _api_get(self, search: str, limit: int, skip: int) -> Optional[dict]:
+    def _api_get(self, search: str, limit: int, skip: int, base_url: str = API_URL) -> Optional[dict]:
         params = f'search={quote(search)}&limit={limit}&skip={skip}'
         if API_KEY:
             params += f'&api_key={quote(API_KEY)}'
-        url = f'{API_URL}?{params}'
+        url = f'{base_url}?{params}'
 
         for attempt in range(3):
             if API_DELAY_SECONDS:
@@ -554,7 +584,9 @@ class UnitedStatesFDACrawler:
                     continue
 
             # 404 is openFDA's "no matches", which is a legitimate answer for
-            # a partition prefix that matches nothing (e.g. ANDA1*).
+            # a partition prefix that matches nothing (e.g. ANDA1*), or for an
+            # application with no SPL label on file at all (common for older
+            # approvals that predate the SPL requirement).
             if resp.status_code == 404:
                 return {'results': [], 'meta': {'results': {'total': 0}}}
 
@@ -568,6 +600,44 @@ class UnitedStatesFDACrawler:
                            f"for {search} (skip={skip})")
             return None
         return None
+
+    def _fetch_labels(self, appl_no: str) -> Optional[List[dict]]:
+        """
+        Fetch every SPL label record openFDA links to this application via
+        `openfda.application_number` — an exact-match keyword field on the
+        label side, confirmed live, but an ARRAY: some labels (e.g.
+        trametinib/Mekinist) list MORE THAN ONE application_number, because a
+        later application (a new indication, typically) reused an earlier
+        one's already-approved label verbatim.
+
+        Querying per-application-number here — never enumerating label.json
+        globally — means a shared label is fetched once per application it
+        belongs to and attached under EACH application's own row. That is
+        correct, not a duplicate: `appl_no` is always one of drugsfda.json's
+        own already-deduped, genuinely distinct application_number values
+        (see _process_application's dedup check), so two applications
+        sharing one label are two real FDA records that happen to reference
+        the same document — both rows are supposed to carry a copy of it.
+
+        Returns None (not []) on a real fetch failure, so callers can tell
+        "we don't know" apart from "confirmed zero labels" (a 404 — see
+        _api_get) rather than silently treating a failure as "no labels".
+        """
+        page = self._api_get(
+            f'openfda.application_number:"{appl_no}"',
+            limit=LABEL_FETCH_LIMIT, skip=0, base_url=LABEL_URL,
+        )
+        if page is None:
+            return None
+
+        results = page.get('results') or []
+        total = (page.get('meta', {}).get('results', {}) or {}).get('total', 0)
+        if total > len(results):
+            logger.warning(
+                f"[FDA] label lookup for {appl_no} truncated at {len(results)}/{total} "
+                f"(LABEL_FETCH_LIMIT={LABEL_FETCH_LIMIT}) — raise it if this recurs"
+            )
+        return results
 
     def _api_collect(self, prefix: str, depth: int = 0) -> Optional[List[dict]]:
         """
@@ -1060,6 +1130,17 @@ class UnitedStatesFDACrawler:
 
         s3_keys = [d['s3_path'] for d in documents if d.get('s3_path')]
 
+        # The actual SPL label TEXT (indications, warnings, dosage,
+        # ingredients, etc.) — see _fetch_labels for why this is looked up
+        # per-application-number rather than bulk-crawled, and why a label
+        # shared across more than one application_number is correctly
+        # fetched and attached once per application, not a duplicate.
+        spl_labels = self._fetch_labels(appl_no)
+        if spl_labels is None:
+            logger.warning(f"[FDA] Could not fetch openFDA SPL label(s) for {appl_no} "
+                            f"— saving the application without them")
+            spl_labels = []
+
         json_data = {
             'application_number': appl_no,
             'application_type_code': record['application_type_code'],
@@ -1070,9 +1151,13 @@ class UnitedStatesFDACrawler:
                 'original_approvals': record['original_approvals'],
                 'supplements': record['supplements'],
             },
-            'labels': record['labels'],
+            # PDF/document LINKS filed against submissions (category=='label'
+            # is just one of several document categories here) — distinct
+            # from spl_labels below, which is the actual label text content.
+            'label_documents': record['labels'],
             'therapeutic_equivalents': record['therapeutic_equivalents'],
             'documents': documents,
+            'spl_labels': spl_labels,
             'openfda': record.get('openfda'),
             'source_url': OVERVIEW_URL.format(appl_no=appl_no),
         }

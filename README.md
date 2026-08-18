@@ -270,6 +270,27 @@ detection above, locking the egress IP out for >20 minutes (observed).
 container recreation; without that volume every `docker compose up` starts
 from scratch.
 
+**`json_data.spl_labels` — the actual label TEXT, not just a PDF link.**
+Every other field above is *metadata about* a document (a PDF URL, a
+submission date); `spl_labels` is the document's actual content —
+`api.fda.gov/drug/label.json`'s Structured Product Labeling text
+(`indications_and_usage`, `warnings`, `dosage_and_administration`,
+`active_ingredient`, `inactive_ingredient`, and more, already split into
+clean fields), fetched per-application via `_fetch_labels`. Confirmed live
+that `openfda.application_number` is an ARRAY on the label side — some
+labels (e.g. trametinib/Mekinist: `NDA204114` + `NDA217513`) list more than
+one application_number, because a later application reused an earlier
+one's already-approved label verbatim. This does **not** create duplicate
+rows: `_fetch_labels` is only ever called with one already-deduped
+application_number from the discovery step above (label.json itself is
+never bulk-crawled), so the shared label is fetched once per application it
+belongs to and attached under that application's own row — two genuinely
+distinct FDA applications sharing one label, not the same record twice.
+Tune with `FDA_LABEL_API_URL` / `FDA_LABEL_FETCH_LIMIT`; a fetch failure
+(distinguished from a confirmed-empty 404 "no label on file") logs a
+warning and the application still saves without it, since not every
+application predates the SPL requirement.
+
 Resolution order is **fresh cache → download → stale cache**. That last step
 is deliberate: if the download is blocked but any cached copy exists, the run
 proceeds on it at any age with a loud warning, because FDA's data moves
