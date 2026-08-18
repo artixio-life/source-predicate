@@ -129,21 +129,36 @@ about a file, not its content. `json_data.spl_labels` is different: it's
 openFDA's `api.fda.gov/drug/label.json`, the actual Structured Product
 Labeling TEXT (indications_and_usage, warnings, dosage_and_administration,
 active_ingredient, inactive_ingredient, contraindications, and more, all
-already split into clean fields) fetched per-application via
-`_fetch_labels`. No skip-cap partitioning is needed here (unlike the bulk
-drugsfda discovery above) because each lookup is scoped to one
-application_number and never returns more than a handful of records.
+already split into clean fields).
+
+**Fetched in ONE batched pass, not one call per application.** An earlier
+version called label.json once per application from inside each worker
+(~29k calls for a full run). Measured live: 8 concurrent workers each
+independently pacing their own calls at FDA_API_DELAY_SECONDS produced an
+aggregate rate of ~249 req/min — already AT/OVER openFDA's published
+240/min per-IP cap (which applies globally across every endpoint, not
+per-worker), so the crawl was constantly tripping 429s and paying a 30-90s
+backoff sleep per hit. `_prefetch_labels` (called once from
+`process_country`, before the worker pool starts) instead OR-batches many
+application_numbers into each query — confirmed live openFDA supports this
+— cutting ~29,269 calls down to ~(applications / LABEL_BATCH_SIZE), around
+100 for a full run, comfortably under the rate limit even run single-lane
+with no concurrency at all. Confirmed live the batch size is bounded by
+the underlying reverse proxy's URL length limit (a 400-number batch, ~7.7KB,
+succeeds; 500, ~9.6KB, gets "414 Request-URI Too Large"); `LABEL_BATCH_SIZE`
+defaults to 300 for margin.
 
 `openfda.application_number` is confirmed live to be an ARRAY on the label
 side: some labels (e.g. trametinib/Mekinist, NDA204114 + NDA217513) list
 MORE THAN ONE application_number, because a later application reused an
 earlier one's already-approved label verbatim. This does NOT create
-duplicate rows: `_fetch_labels` is only ever called with one already-
-deduped, genuinely distinct application_number from drugsfda.json (this
-crawler never enumerates label.json globally), so the shared label is
-fetched independently for each application it belongs to and attached
-under that application's own row — two real FDA applications sharing one
-label document, not one label duplicated.
+duplicate rows: `_prefetch_labels` indexes a returned label under EVERY
+application_number in its own array that matches one of drugsfda.json's
+own already-deduped, genuinely distinct applications (this crawler never
+persists label.json records directly, only attaches them under an
+application's row), so two applications sharing one label are two real FDA
+records that happen to reference the same document — both rows carry a
+copy of it, never a duplicated row.
 
 Dedup is by `json_data.application_number`
 ------------------------------------------
@@ -204,10 +219,20 @@ SOURCES = (
 API_URL = os.getenv('FDA_API_URL', 'https://api.fda.gov/drug/drugsfda.json')
 # openFDA's SPL label content — the actual label TEXT (indications_and_usage,
 # warnings, dosage_and_administration, active/inactive ingredients, etc.),
-# not just a PDF link. Queried per-application-number (never bulk-crawled),
-# so it never needs skip-cap partitioning — see _fetch_labels.
+# not just a PDF link. Queried in batches (see _prefetch_labels) rather
+# than bulk-crawled, so it never needs skip-cap partitioning either.
 LABEL_URL = os.getenv('FDA_LABEL_API_URL', 'https://api.fda.gov/drug/label.json')
-LABEL_FETCH_LIMIT = int(os.getenv('FDA_LABEL_FETCH_LIMIT', '100'))
+# openFDA supports OR-batching multiple application_numbers into ONE query
+# (confirmed live) — this is what makes label lookups fast at ~29k
+# applications instead of one request each. 300 is a safe batch size:
+# confirmed live the underlying reverse proxy 414s on a query URL around
+# ~8-9KB (400 numbers = ~7.7KB succeeds, 500 = ~9.6KB fails with
+# "414 Request-URI Too Large"); 300 (~5.8KB) leaves real margin.
+LABEL_BATCH_SIZE = int(os.getenv('FDA_LABEL_BATCH_SIZE', '300'))
+# Generous per-batch result limit — openFDA's own max — since most
+# applications have 0-2 labels each, a 300-application batch rarely
+# approaches even this, but _prefetch_labels warns loudly if one ever does.
+LABEL_BATCH_RESULT_LIMIT = 1000
 OPENFDA_ZIP_URL = os.getenv(
     'FDA_OPENFDA_ZIP_URL',
     'https://download.open.fda.gov/drug/drugsfda/drug-drugsfda-0001-of-0001.json.zip',
@@ -458,7 +483,12 @@ class UnitedStatesFDACrawler:
             return
 
         logger.info(f"[FDA] {len(applications)} unique application(s) to process")
-        saved = self._process_applications_concurrently(country_id, applications)
+        # Batched up front (~100 requests total) rather than one label.json
+        # call per application inside each worker below — see
+        # _prefetch_labels for the measured rate-limit math that made the
+        # per-application version too slow.
+        labels_by_appl_no = self._prefetch_labels(applications)
+        saved = self._process_applications_concurrently(country_id, applications, labels_by_appl_no)
         logger.info(f"FDA crawl finished. Saved/updated {saved} applications "
                     f"({len(applications)} discovered).")
 
@@ -601,55 +631,86 @@ class UnitedStatesFDACrawler:
             return None
         return None
 
-    def _fetch_labels(self, openfda_application_number: str) -> Optional[List[dict]]:
+    def _prefetch_labels(self, applications: Dict[str, dict]) -> Dict[str, List[dict]]:
         """
-        Fetch every SPL label record openFDA links to this application via
-        `openfda.application_number` — an exact-match keyword field on the
-        label side, confirmed live, but an ARRAY: some labels (e.g.
-        trametinib/Mekinist) list MORE THAN ONE application_number, because a
-        later application (a new indication, typically) reused an earlier
-        one's already-approved label verbatim.
+        Fetch every SPL label for every discovered application in ONE pass,
+        batching many application_numbers into each label.json query —
+        openFDA supports OR-ing multiple values into one `search`, confirmed
+        live (`openfda.application_number:("NDA1" OR "NDA2" OR ...)`).
 
-        `openfda_application_number` MUST be the type-PREFIXED form (e.g.
-        "NDA020695", matching drugsfda.json's own native `application_number`
-        field exactly) — NOT this crawler's internal prefix-stripped,
-        zero-padded `appl_no` (e.g. "020695") used for dedup/storage
-        elsewhere in this file. Confirmed live: querying with the bare form
-        returns a 404 unconditionally, for every application, regardless of
-        whether a real label exists — a real bug caught only by running
-        _process_application end-to-end rather than unit-testing this method
-        with a hand-typed, already-correct argument. See the caller in
-        _process_application for how the prefixed form is reconstructed.
+        This replaced an earlier per-application design (one label.json call
+        inside _process_application per application, ~29k calls total) that
+        made the crawl far slower than it needed to be: measured live, 8
+        concurrent workers each independently pacing their own calls at
+        FDA_API_DELAY_SECONDS produced an aggregate rate of ~249 req/min —
+        already AT/OVER openFDA's published 240/min per-IP cap (which
+        applies globally across every endpoint, not per-worker), so the
+        crawl was constantly tripping 429s and paying a 30-90s backoff sleep
+        per hit, on top of the ~29,269 calls needed at 1 each. Batching
+        turns that into ~(applications / LABEL_BATCH_SIZE) calls — about 100
+        for a full run — which comfortably fits the rate limit even run
+        single-lane with no concurrency at all, so this method doesn't need
+        (and doesn't use) a thread pool.
 
-        Querying per-application-number here — never enumerating label.json
-        globally — means a shared label is fetched once per application it
-        belongs to and attached under EACH application's own row. That is
-        correct, not a duplicate: the caller always passes one of
-        drugsfda.json's own already-deduped, genuinely distinct
-        application_number values (see _process_application's dedup check),
-        so two applications sharing one label are two real FDA records that
-        happen to reference the same document — both rows are supposed to
-        carry a copy of it.
+        `openfda.application_number` is an ARRAY on the label side: some
+        labels (e.g. trametinib/Mekinist) list MORE THAN ONE application
+        number, because a later application reused an earlier one's
+        already-approved label verbatim (see _process_application's
+        docstring cross-reference). A returned label is indexed under EVERY
+        application_number in its own array that we're looking for —
+        regardless of which batch surfaced it — so a shared label resolves
+        correctly for every application it belongs to, exactly as the old
+        per-application lookup did, just computed once up front instead of
+        redundantly per application.
 
-        Returns None (not []) on a real fetch failure, so callers can tell
-        "we don't know" apart from "confirmed zero labels" (a 404 — see
-        _api_get) rather than silently treating a failure as "no labels".
+        Returns {appl_no: [label, ...]}; an application with no key present
+        had zero labels found (matches the old per-call 404 = "confirmed
+        empty" semantics) — callers should use .get(appl_no, []).
         """
-        page = self._api_get(
-            f'openfda.application_number:"{openfda_application_number}"',
-            limit=LABEL_FETCH_LIMIT, skip=0, base_url=LABEL_URL,
-        )
-        if page is None:
-            return None
+        # Map OUR type-prefixed openFDA key (e.g. "NDA020695") back to every
+        # internal appl_no (e.g. "020695") it corresponds to — normally one,
+        # but built as a list for correctness if that ever isn't true.
+        # Applications with no application_type_code can't be searched at
+        # all (see _process_application's caller-side check before this
+        # existed) and are simply omitted here.
+        wanted: Dict[str, List[str]] = defaultdict(list)
+        for appl_no, record in applications.items():
+            type_code = record.get('application_type_code')
+            if type_code:
+                wanted[f'{type_code}{appl_no}'].append(appl_no)
 
-        results = page.get('results') or []
-        total = (page.get('meta', {}).get('results', {}) or {}).get('total', 0)
-        if total > len(results):
-            logger.warning(
-                f"[FDA] label lookup for {openfda_application_number} truncated at {len(results)}/{total} "
-                f"(LABEL_FETCH_LIMIT={LABEL_FETCH_LIMIT}) — raise it if this recurs"
-            )
-        return results
+        labels_by_appl_no: Dict[str, List[dict]] = defaultdict(list)
+        openfda_keys = list(wanted.keys())
+        total_batches = -(-len(openfda_keys) // LABEL_BATCH_SIZE) if openfda_keys else 0
+        logger.info(f"[FDA] Prefetching SPL labels for {len(openfda_keys)} application(s) "
+                    f"in {total_batches} batch(es) of up to {LABEL_BATCH_SIZE}")
+
+        for batch_num, i in enumerate(range(0, len(openfda_keys), LABEL_BATCH_SIZE), start=1):
+            batch = openfda_keys[i:i + LABEL_BATCH_SIZE]
+            search = 'openfda.application_number:(' + ' OR '.join(f'"{k}"' for k in batch) + ')'
+            page = self._api_get(search, limit=LABEL_BATCH_RESULT_LIMIT, skip=0, base_url=LABEL_URL)
+            if page is None:
+                logger.warning(f"[FDA] Label batch {batch_num}/{total_batches} failed outright — "
+                               f"{len(batch)} application(s) in it will show no labels")
+                continue
+
+            results = page.get('results') or []
+            total = (page.get('meta', {}).get('results', {}) or {}).get('total', 0)
+            if total > len(results):
+                logger.warning(
+                    f"[FDA] Label batch {batch_num}/{total_batches} truncated at "
+                    f"{len(results)}/{total} — raise LABEL_BATCH_RESULT_LIMIT or shrink "
+                    f"FDA_LABEL_BATCH_SIZE if this recurs"
+                )
+
+            for label in results:
+                for openfda_appl_no in (label.get('openfda') or {}).get('application_number') or []:
+                    for appl_no in wanted.get(openfda_appl_no, ()):
+                        labels_by_appl_no[appl_no].append(label)
+
+        logger.info(f"[FDA] Prefetched labels for {len(labels_by_appl_no)}/{len(applications)} "
+                    f"application(s)")
+        return labels_by_appl_no
 
     def _api_collect(self, prefix: str, depth: int = 0) -> Optional[List[dict]]:
         """
@@ -1089,13 +1150,18 @@ class UnitedStatesFDACrawler:
     # optional PDF downloading)
     # ------------------------------------------------------------------
 
-    def _process_applications_concurrently(self, country_id: int, applications: Dict[str, dict]) -> int:
+    def _process_applications_concurrently(
+        self, country_id: int, applications: Dict[str, dict], labels_by_appl_no: Dict[str, List[dict]],
+    ) -> int:
         saved = 0
         error = None
 
         with ThreadPoolExecutor(max_workers=WORKERS) as pool:
             futures = {
-                pool.submit(self._process_application, country_id, appl_no, record): appl_no
+                pool.submit(
+                    self._process_application, country_id, appl_no, record,
+                    labels_by_appl_no.get(appl_no, []),
+                ): appl_no
                 for appl_no, record in applications.items()
             }
             for future in as_completed(futures):
@@ -1125,7 +1191,9 @@ class UnitedStatesFDACrawler:
             raise error
         return saved
 
-    def _process_application(self, country_id: int, appl_no: str, record: dict) -> bool:
+    def _process_application(
+        self, country_id: int, appl_no: str, record: dict, spl_labels: List[dict],
+    ) -> bool:
         if check_record_exists_by_json_field(country_id, 'application_number', appl_no):
             return False
 
@@ -1143,32 +1211,11 @@ class UnitedStatesFDACrawler:
         s3_keys = [d['s3_path'] for d in documents if d.get('s3_path')]
 
         # The actual SPL label TEXT (indications, warnings, dosage,
-        # ingredients, etc.) — see _fetch_labels for why this is looked up
-        # per-application-number rather than bulk-crawled, and why a label
-        # shared across more than one application_number is correctly
-        # fetched and attached once per application, not a duplicate.
-        #
-        # `appl_no` here is OUR internal, prefix-stripped, zero-padded key
-        # (e.g. "020695") — NOT what label.json's own openfda.application_number
-        # field contains, which is always prefixed (e.g. "NDA020695", matching
-        # drugsfda.json's own native application_number exactly, confirmed
-        # live). Searching with the bare form returns a 404 unconditionally,
-        # for every application, regardless of whether a real label exists —
-        # confirmed live this was silently swallowing every match (e.g. a
-        # shared Mekinist-style label) as "no label found". Reconstruct the
-        # prefixed form before calling _fetch_labels; skip the lookup
-        # entirely (rather than searching with a value known to never match)
-        # if application_type_code is missing.
-        openfda_appl_no = (
-            f"{record['application_type_code']}{appl_no}"
-            if record.get('application_type_code') else None
-        )
-        spl_labels = self._fetch_labels(openfda_appl_no) if openfda_appl_no else []
-        if openfda_appl_no and spl_labels is None:
-            logger.warning(f"[FDA] Could not fetch openFDA SPL label(s) for {appl_no} "
-                            f"— saving the application without them")
-            spl_labels = []
-
+        # ingredients, etc.) — pre-fetched for every application in one
+        # batched pass by _prefetch_labels (called once from
+        # process_country), not looked up here per application. An empty
+        # list means "confirmed zero labels found for this application",
+        # same semantics as the old per-call 404.
         json_data = {
             'application_number': appl_no,
             'application_type_code': record['application_type_code'],
