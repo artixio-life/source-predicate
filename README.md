@@ -276,20 +276,63 @@ submission date); `spl_labels` is the document's actual content —
 `api.fda.gov/drug/label.json`'s Structured Product Labeling text
 (`indications_and_usage`, `warnings`, `dosage_and_administration`,
 `active_ingredient`, `inactive_ingredient`, and more, already split into
-clean fields), fetched per-application via `_fetch_labels`. Confirmed live
-that `openfda.application_number` is an ARRAY on the label side — some
-labels (e.g. trametinib/Mekinist: `NDA204114` + `NDA217513`) list more than
-one application_number, because a later application reused an earlier
-one's already-approved label verbatim. This does **not** create duplicate
-rows: `_fetch_labels` is only ever called with one already-deduped
-application_number from the discovery step above (label.json itself is
-never bulk-crawled), so the shared label is fetched once per application it
-belongs to and attached under that application's own row — two genuinely
-distinct FDA applications sharing one label, not the same record twice.
-Tune with `FDA_LABEL_API_URL` / `FDA_LABEL_FETCH_LIMIT`; a fetch failure
-(distinguished from a confirmed-empty 404 "no label on file") logs a
-warning and the application still saves without it, since not every
-application predates the SPL requirement.
+clean fields). Confirmed live that `openfda.application_number` is an ARRAY
+on the label side — some labels (e.g. trametinib/Mekinist: `NDA204114` +
+`NDA217513`) list more than one application_number, because a later
+application reused an earlier one's already-approved label verbatim. This
+does **not** create duplicate rows: a returned label is indexed under
+every application_number in its own array that matches one of
+drugsfda.json's own already-deduped, genuinely distinct applications, so
+the shared label is attached under each application's own row — two
+genuinely distinct FDA applications sharing one label, not the same record
+twice.
+
+**Fetched in ~100 batched requests, not one per application.** An earlier
+version called label.json once per application from inside each worker
+(~29k calls for a full run). Measured live: 8 concurrent workers each
+independently pacing their own calls produced an aggregate rate of ~249
+req/min — already at/over openFDA's published 240/min per-IP cap (global
+across every endpoint, not per-worker), so the crawl was constantly
+tripping 429s and paying a 30-90s backoff sleep per hit. `prefetch_labels`
+now OR-batches many application_numbers into each query (confirmed live
+openFDA supports this, bounded by the reverse proxy's ~8KB URL length
+limit — `FDA_LABEL_BATCH_SIZE` defaults to 300 for margin) in one pass
+before the worker pool starts, cutting label lookups to roughly
+`applications / FDA_LABEL_BATCH_SIZE` requests total — comfortably under
+the rate limit even run single-lane with no concurrency at all. Tune with
+`FDA_LABEL_API_URL` / `FDA_LABEL_BATCH_SIZE`; a batch that fails outright
+logs a warning and every application in it gets `spl_labels: []` rather
+than blocking the whole run, since not every application predates the SPL
+requirement anyway (an empty result is often correct, not a failure).
+
+**Backfilling `spl_labels` onto an already-ingested run.** If US data was
+already fully crawled before this batching (or the label feature) existed,
+re-crawling from scratch just to pick up `spl_labels` would mean
+re-fetching every application from drugsfda.json/the TSV and
+re-downloading every PDF for no reason — none of that is affected by the
+label fix. `app/crawlers/united_states/backfill_labels.py` instead reads
+every existing US row's `application_number`/`application_type_code`
+straight out of its own already-stored `json_data`, runs them through the
+same batched `prefetch_labels()`, and `UPDATE`s only the `spl_labels` key
+via Postgres's jsonb `||` merge — every other field (products, documents,
+approval_history, `document_url`, ...) is left untouched. Every row is
+reprocessed unconditionally (not just rows missing the key), since a
+present-but-empty `spl_labels: []` from a run that predates the
+type-prefix fix isn't trustworthy evidence that no label exists. Triggered
+via `FDA_BACKFILL_LABELS=true`, checked at the top of `app/main.py` — when
+set, it runs ONLY the backfill instead of the normal per-country crawl
+loop, then exits:
+
+```bash
+# Preview first — logs counts, writes nothing
+FDA_BACKFILL_LABELS=true FDA_BACKFILL_DRY_RUN=true python -m app.main
+
+# Then actually write
+FDA_BACKFILL_LABELS=true python -m app.main
+```
+
+Unset `FDA_BACKFILL_LABELS` afterwards so later runs go back to the normal
+crawl.
 
 Resolution order is **fresh cache → download → stale cache**. That last step
 is deliberate: if the download is blocked but any cached copy exists, the run

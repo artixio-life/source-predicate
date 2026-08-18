@@ -138,7 +138,7 @@ independently pacing their own calls at FDA_API_DELAY_SECONDS produced an
 aggregate rate of ~249 req/min — already AT/OVER openFDA's published
 240/min per-IP cap (which applies globally across every endpoint, not
 per-worker), so the crawl was constantly tripping 429s and paying a 30-90s
-backoff sleep per hit. `_prefetch_labels` (called once from
+backoff sleep per hit. `prefetch_labels` (called once from
 `process_country`, before the worker pool starts) instead OR-batches many
 application_numbers into each query — confirmed live openFDA supports this
 — cutting ~29,269 calls down to ~(applications / LABEL_BATCH_SIZE), around
@@ -152,7 +152,7 @@ defaults to 300 for margin.
 side: some labels (e.g. trametinib/Mekinist, NDA204114 + NDA217513) list
 MORE THAN ONE application_number, because a later application reused an
 earlier one's already-approved label verbatim. This does NOT create
-duplicate rows: `_prefetch_labels` indexes a returned label under EVERY
+duplicate rows: `prefetch_labels` indexes a returned label under EVERY
 application_number in its own array that matches one of drugsfda.json's
 own already-deduped, genuinely distinct applications (this crawler never
 persists label.json records directly, only attaches them under an
@@ -219,7 +219,7 @@ SOURCES = (
 API_URL = os.getenv('FDA_API_URL', 'https://api.fda.gov/drug/drugsfda.json')
 # openFDA's SPL label content — the actual label TEXT (indications_and_usage,
 # warnings, dosage_and_administration, active/inactive ingredients, etc.),
-# not just a PDF link. Queried in batches (see _prefetch_labels) rather
+# not just a PDF link. Queried in batches (see prefetch_labels) rather
 # than bulk-crawled, so it never needs skip-cap partitioning either.
 LABEL_URL = os.getenv('FDA_LABEL_API_URL', 'https://api.fda.gov/drug/label.json')
 # openFDA supports OR-batching multiple application_numbers into ONE query
@@ -231,7 +231,7 @@ LABEL_URL = os.getenv('FDA_LABEL_API_URL', 'https://api.fda.gov/drug/label.json'
 LABEL_BATCH_SIZE = int(os.getenv('FDA_LABEL_BATCH_SIZE', '300'))
 # Generous per-batch result limit — openFDA's own max — since most
 # applications have 0-2 labels each, a 300-application batch rarely
-# approaches even this, but _prefetch_labels warns loudly if one ever does.
+# approaches even this, but prefetch_labels warns loudly if one ever does.
 LABEL_BATCH_RESULT_LIMIT = 1000
 OPENFDA_ZIP_URL = os.getenv(
     'FDA_OPENFDA_ZIP_URL',
@@ -485,9 +485,9 @@ class UnitedStatesFDACrawler:
         logger.info(f"[FDA] {len(applications)} unique application(s) to process")
         # Batched up front (~100 requests total) rather than one label.json
         # call per application inside each worker below — see
-        # _prefetch_labels for the measured rate-limit math that made the
+        # prefetch_labels for the measured rate-limit math that made the
         # per-application version too slow.
-        labels_by_appl_no = self._prefetch_labels(applications)
+        labels_by_appl_no = self.prefetch_labels(applications)
         saved = self._process_applications_concurrently(country_id, applications, labels_by_appl_no)
         logger.info(f"FDA crawl finished. Saved/updated {saved} applications "
                     f"({len(applications)} discovered).")
@@ -631,7 +631,7 @@ class UnitedStatesFDACrawler:
             return None
         return None
 
-    def _prefetch_labels(self, applications: Dict[str, dict]) -> Dict[str, List[dict]]:
+    def prefetch_labels(self, applications: Dict[str, dict]) -> Dict[str, List[dict]]:
         """
         Fetch every SPL label for every discovered application in ONE pass,
         batching many application_numbers into each label.json query —
@@ -1212,7 +1212,7 @@ class UnitedStatesFDACrawler:
 
         # The actual SPL label TEXT (indications, warnings, dosage,
         # ingredients, etc.) — pre-fetched for every application in one
-        # batched pass by _prefetch_labels (called once from
+        # batched pass by prefetch_labels (called once from
         # process_country), not looked up here per application. An empty
         # list means "confirmed zero labels found for this application",
         # same semantics as the old per-call 404.

@@ -1,3 +1,4 @@
+import os
 import sys
 import logging
 import concurrent.futures
@@ -93,6 +94,16 @@ def main():
         init_db()
     except Exception as e:
         logger.error(f"DB init failed: {e}")
+
+    # One-off maintenance path: backfill json_data.spl_labels onto already-
+    # ingested US rows without re-crawling anything (see
+    # app/crawlers/united_states/backfill_labels.py for why). Runs INSTEAD
+    # of the normal crawl loop below, then exits — unset this afterwards.
+    if os.getenv('FDA_BACKFILL_LABELS', 'false').lower() == 'true':
+        from app.crawlers.united_states import backfill_labels
+        logger.info("FDA_BACKFILL_LABELS=true — running the US spl_labels backfill instead of a normal crawl")
+        backfill_labels.run()
+        return
 
     countries = get_registered_countries()
     logger.info(f"Found {len(countries)} registered country crawlers: {[c[0] for c in countries]}")
