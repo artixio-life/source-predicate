@@ -403,6 +403,33 @@ since many distinct applications share a brand/generic name.
 network I/O left in that fan-out is optional PDF downloading.
 `FDA_BULK_ZIP_URL` overrides the download location.
 
+## Saudi Arabia Crawler — SFDA New Drug Approvals
+
+`sfda.gov.sa` is a plain server-rendered Drupal site (Views module) — no
+browser needed (`app/crawlers/saudi_arabia/crawler_sa_1.py` uses plain
+`requests` + BeautifulSoup, the same pattern as the South Africa crawler):
+
+- **Listing**: `GET /en/new-sfda-drug-approvals?page=<N>` (0-indexed) — a
+  standard Drupal Views table, 10 rows/page: Request Type, Drug Type,
+  Trade Name, Scientific Name, Strength, Dosage Form, Approval Date, and a
+  "SFDA Approved Use" link per row pointing at
+  `/en/drug-approvals-use/<id>`. As of 2026-08: 34 pages, ~336 rows.
+  Confirmed live `items_per_page` isn't honored by this view (the page
+  size is fixed at 10), so this is a real ~34-request crawl.
+- **Detail**: `GET /en/drug-approvals-use/<id>` — a full HTML page
+  (confirmed live: identical whether or not Drupal's AJAX headers are
+  sent) containing exactly one field beyond what the listing row already
+  has — the drug's approved indication/use text. No attached PDF/label on
+  this source at all, so `document_url` is always empty, the same as the
+  South Africa crawler.
+
+Dedup is by `json_data.sfda_use_id` — the numeric id in each row's own
+`/en/drug-approvals-use/<id>` link. Confirmed live this is per-row unique
+even when `trade_name` isn't: two different strengths of "Brevie" (25mg
+and 50mg) are two separate rows linking to two different ids (18627 and
+18625) — trade_name alone would incorrectly collide two distinct
+approvals into one dedup key.
+
 ## Crawler Interface
 
 Every crawler class registered in `app/crawlers/<country>/__init__.py` must implement:
