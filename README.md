@@ -403,32 +403,66 @@ since many distinct applications share a brand/generic name.
 network I/O left in that fan-out is optional PDF downloading.
 `FDA_BULK_ZIP_URL` overrides the download location.
 
-## Saudi Arabia Crawler — SFDA New Drug Approvals
+## Saudi Arabia Crawler — SFDA New Drug Approvals + Human Drugs Registry
 
 `sfda.gov.sa` is a plain server-rendered Drupal site (Views module) — no
 browser needed (`app/crawlers/saudi_arabia/crawler_sa_1.py` uses plain
-`requests` + BeautifulSoup, the same pattern as the South Africa crawler):
+`requests` + BeautifulSoup, the same pattern as the South Africa crawler).
+Two independent sources are combined into this ONE crawler (the registry
+has one crawler class per country — see "Adding a New Country Crawler"
+below), each with its own dedup key so neither can collide with the other:
 
+**Source 1 — New Drug Approvals** (a small, rolling list; ~336 rows):
 - **Listing**: `GET /en/new-sfda-drug-approvals?page=<N>` (0-indexed) — a
   standard Drupal Views table, 10 rows/page: Request Type, Drug Type,
   Trade Name, Scientific Name, Strength, Dosage Form, Approval Date, and a
   "SFDA Approved Use" link per row pointing at
-  `/en/drug-approvals-use/<id>`. As of 2026-08: 34 pages, ~336 rows.
-  Confirmed live `items_per_page` isn't honored by this view (the page
-  size is fixed at 10), so this is a real ~34-request crawl.
+  `/en/drug-approvals-use/<id>`. As of 2026-08: 34 pages. Confirmed live
+  `items_per_page` isn't honored by this view (the page size is fixed at
+  10), so this is a real ~34-request crawl.
 - **Detail**: `GET /en/drug-approvals-use/<id>` — a full HTML page
   (confirmed live: identical whether or not Drupal's AJAX headers are
   sent) containing exactly one field beyond what the listing row already
-  has — the drug's approved indication/use text. No attached PDF/label on
-  this source at all, so `document_url` is always empty, the same as the
-  South Africa crawler.
+  has — the drug's approved indication/use text.
+- Dedup: `json_data.sfda_use_id` — confirmed live per-row unique even when
+  `trade_name` isn't (two strengths of "Brevie" link to two different ids).
 
-Dedup is by `json_data.sfda_use_id` — the numeric id in each row's own
-`/en/drug-approvals-use/<id>` link. Confirmed live this is per-row unique
-even when `trade_name` isn't: two different strengths of "Brevie" (25mg
-and 50mg) are two separate rows linking to two different ids (18627 and
-18625) — trade_name alone would incorrectly collide two distinct
-approvals into one dedup key.
+**Source 2 — Human Drugs Registry** (the comprehensive national registry;
+~20,925 rows, `/ar/drugs-list`, ARABIC locale only — see below):
+- **Listing**: `GET /ar/drugs-list?page=<N>` — 15 rows/page, 1,395 pages.
+  Confirmed live the English version (`/en/drugs-list`) has the same
+  listing but a details endpoint that returns only 6 of ~28 fields — a gap
+  in SFDA's own English rendering, so this source is crawled in Arabic and
+  mapped to English snake_case keys.
+- **Detail**: `POST /ar/details_data?nid=<view-id>&id=<row-id>&page=<N>` —
+  the full ~28-field table (registration number, manufacturer, agents, ATC
+  codes, pack/shelf-life info, pricing). **Three confirmed traps**, found
+  in order: (1) GET silently ignores `id` and always returns the same
+  fixed row — must be POST, confirmed via `drupalSettings.ajax`'s
+  `"httpMethod":"POST"`; (2) the lookup is scoped by `(id, page)`
+  TOGETHER, not `id` alone, so params must be reused verbatim from the
+  row's own link, never reconstructed; (3) even then, a **confirmed ~47%
+  of rows** (35/75 sampled sequentially across pages 0-4) deterministically
+  return an unrelated row's detail — verified NOT flaky (one failing id
+  retried 8× returned the identical wrong row every time, and no `page`
+  value ever resolved it) — a bug in SFDA's own backend with no
+  client-side fix. The crawler cross-checks the fetched detail's own trade
+  name against the listing row's before trusting it, and saves an empty
+  `detail` rather than ever persisting data attributed to the wrong drug —
+  so roughly half of this source's rows will only have their 5
+  listing-level fields, by design, not as a bug in this crawler.
+  Several further fields (`strength_unit`, `package_type`, etc.) come back
+  as the literal string `"Array"` on essentially every row — a separate,
+  confirmed PHP array-to-string bug on SFDA's side — stored as-is so it's
+  visibly distinct from a genuinely empty field.
+- Dedup: `json_data.sfda_drug_id` (the row's own `id`, checked before the
+  detail fetch) — not `registration_number`, since that isn't known until
+  after the detail fetch it would need to gate. `registration_number` is
+  still promoted to a top-level `json_data` field once successfully
+  fetched, the same role SAHPRA's `application_no`/TGA's `artg_id` play.
+
+Neither source has an attached PDF/label, so `document_url` is always
+empty on both — the same as the South Africa crawler.
 
 ## Crawler Interface
 
