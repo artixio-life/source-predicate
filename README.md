@@ -550,3 +550,9 @@ MAX_RECORDS_PER_COUNTRY=20 python -m app.crawlers.united_states.crawler_us_1
 | **MinIO upload fails** | Verify `MINIO_ENDPOINT` points at the running `source-information` MinIO and the credentials match. The bucket is auto-created if missing. |
 | **"No crawler available"** | Ensure the country has a package under `app/crawlers/` with `COUNTRY_CRAWLER` defined. |
 | **Country skipped too early** | The skip-counter is disabled by default (`MAX_SKIPPED_RECORDS_PER_COUNTRY=0`). If it is set above `0` in your environment, a country can stop early on a run of duplicates — regulatory feeds are not date-ordered, so this is usually not what you want. |
+
+## European Union Crawler — EMA Medicine Excel Report
+
+The EU crawler downloads EMA's automatically generated [medicine data report](https://www.ema.europa.eu/en/medicines/download-medicine-data), parses the `Medicine` sheet, and ingests one record per EMA product number. The workbook currently has metadata in row 1, headers in row 9, and medicine rows beginning at row 10; the parser discovers the headers rather than hardcoding the row number.
+
+The report includes the medicine name, EMA product number, status, INN, active substance, therapeutic area, ATC code, therapeutic indication, regulatory flags, authorisation dates, holder/applicant, last-updated date, and medicine-page URL. It is public and requires no API credentials. For each medicine URL, the crawler fetches the page and downloads only the English `Product information` PDF when that exact document exists. It uploads that PDF to MinIO/S3 and stores its source URL and S3 key in `json_data.documents`; it does not download the overview, risk-management plan, assessment report, presentations, other languages, or any other file.

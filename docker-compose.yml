@@ -33,6 +33,12 @@ services:
       - MAX_SKIPPED_RECORDS_PER_COUNTRY=${MAX_SKIPPED_RECORDS_PER_COUNTRY:-0}
       - MAX_WORKERS=${MAX_WORKERS:-2}
       - DOWNLOAD_DOCUMENTS=${DOWNLOAD_DOCUMENTS:-true}
+      # EMA medicine download (European Union) — public Excel report.
+      - EMA_MEDICINES_REPORT_URL=${EMA_MEDICINES_REPORT_URL:-https://www.ema.europa.eu/en/documents/report/medicines-output-medicines-report_en.xlsx}
+      - EMA_MEDICINES_TIMEOUT=${EMA_MEDICINES_TIMEOUT:-120}
+      - EMA_MEDICINES_PAGE_TIMEOUT=${EMA_MEDICINES_PAGE_TIMEOUT:-60}
+      - EMA_MEDICINES_REQUEST_DELAY=${EMA_MEDICINES_REQUEST_DELAY:-3}
+      - EMA_MEDICINES_PDF_RETRIES=${EMA_MEDICINES_PDF_RETRIES:-5}
     volumes:
       # Persists the FDA bulk-data zip across container recreations. Without
       # this, every `docker compose up` re-downloads it, and a few rapid
