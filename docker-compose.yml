@@ -39,6 +39,13 @@ services:
       - EMA_MEDICINES_PAGE_TIMEOUT=${EMA_MEDICINES_PAGE_TIMEOUT:-60}
       - EMA_MEDICINES_REQUEST_DELAY=${EMA_MEDICINES_REQUEST_DELAY:-3}
       - EMA_MEDICINES_PDF_RETRIES=${EMA_MEDICINES_PDF_RETRIES:-5}
+      # One-off maintenance paths (see app/main.py) — run INSTEAD of the
+      # normal crawl loop when set, so they must be unset again afterwards.
+      - FDA_BACKFILL_LABELS=${FDA_BACKFILL_LABELS:-false}
+      - FDA_BACKFILL_DRY_RUN=${FDA_BACKFILL_DRY_RUN:-false}
+      - UK_BACKFILL_REGISTRATION_NUMBERS=${UK_BACKFILL_REGISTRATION_NUMBERS:-false}
+      - UK_BACKFILL_APPLY=${UK_BACKFILL_APPLY:-false}
+      - UK_BACKFILL_LIMIT=${UK_BACKFILL_LIMIT:-}
     volumes:
       # Persists the FDA bulk-data zip across container recreations. Without
       # this, every `docker compose up` re-downloads it, and a few rapid

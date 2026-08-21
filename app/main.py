@@ -105,6 +105,23 @@ def main():
         backfill_labels.run()
         return
 
+    # One-off maintenance path: re-partitions already-ingested UK MHRA rows
+    # by registration number and resolves numbers file_name regex can't get
+    # (see app/crawlers/united_kingdom/backfill_registration_numbers.py).
+    # Runs INSTEAD of the normal crawl loop below, then exits — unset this
+    # afterwards.
+    if os.getenv('UK_BACKFILL_REGISTRATION_NUMBERS', 'false').lower() == 'true':
+        from app.crawlers.united_kingdom import backfill_registration_numbers
+        apply_changes = os.getenv('UK_BACKFILL_APPLY', 'false').lower() == 'true'
+        limit_env = os.getenv('UK_BACKFILL_LIMIT')
+        limit = int(limit_env) if limit_env else None
+        logger.info(
+            f"UK_BACKFILL_REGISTRATION_NUMBERS=true — running the UK registration-number "
+            f"backfill instead of a normal crawl (apply={apply_changes}, limit={limit})"
+        )
+        backfill_registration_numbers.run(apply=apply_changes, limit=limit)
+        return
+
     countries = get_registered_countries()
     logger.info(f"Found {len(countries)} registered country crawlers: {[c[0] for c in countries]}")
 

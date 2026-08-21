@@ -66,11 +66,22 @@ on-page navigation turns up zero document cards.
 
 Record mapping
 --------------
-One row per product (not per document): a product's SPC, PIL, and PAR
-documents are collected into a single `document_url` array, ordered SPC
-first (then PIL, then PAR, then anything else) per instruction. `name` is
-taken from the SPC card's title when an SPC exists, else the first
-available card's title, else the product link's own text.
+One row per marketing authorisation (registration number), NOT per product
+page. A single `/product/?product=` page frequently bundles documents from
+several distinct licences under one display name — e.g. an originator's own
+authorisation (PLGB 00101-1041) alongside unrelated parallel-import licences
+(PLPI 45763-1100, -1101, -1102, ...) that happen to share the same product
+name. Each of those is a separate legal authorisation and must not be
+merged into one row. So cards are first grouped by the registration number
+parsed out of `file_name` (see `_extract_registration_number` — the PL
+prefix, e.g. `PL`/`PLGB`/`PLNI`/`PLPI`, is noise; the stable identifier is
+the `NNNNN/NNNN` digit pair after it), and only *within* each group are
+documents ordered SPC first (then PIL, then PAR, then anything else) and
+saved as their own row. `name` is taken from the SPC card's title when the
+group has one, else the group's first available card's title, else the
+product link's own text. A card whose file name carries no parseable
+registration number falls back into a single group keyed by the product
+name, matching the old (pre-grouping) behaviour, so nothing is dropped.
 
 `document_url` holds OUR S3 keys, not MHRA's URLs
 --------------------------------------------------
@@ -83,13 +94,18 @@ separately, at json_data.documents[i].source_url, purely for
 provenance/re-download — it is NOT used for dedup (see below), since it
 would require a JSONB scan for no real benefit here.
 
-Dedup is by `name`
-------------------
-One row per distinct /product/?product=<name> page by design, so `name`
+Dedup is by `registration_number`, falling back to `name`
+-----------------------------------------------------------
+Each saved row carries its group's registration number at
+`json_data.registration_number` (same field name/shape as the Saudi SFDA
+crawler's `registerNumber` dedup, see README) when one was parsed; a
+re-crawl checks `app.db.check_record_exists_by_json_field(country_id,
+'registration_number', value)` before saving that group again. A group with
+no parseable registration number (see module docstring above) falls back to
+`app.db.check_record_exists_by_name`, same as before this change — `name`
 (indexed, `source.drug_predicate_raw_records.name`) is a stable, cheap
-duplicate check (`app.db.check_record_exists_by_name`) — unlike
-`document_url` (a fresh S3 key on every upload, never reproducible, so it
-can never match a prior run).
+duplicate check unlike `document_url` (a fresh S3 key on every upload,
+never reproducible, so it can never match a prior run).
 """
 
 from __future__ import annotations
@@ -109,6 +125,7 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 
 from app.db import (
     CountrySkipThresholdReached,
+    check_record_exists_by_json_field,
     check_record_exists_by_name,
     save_drug_record,
 )
@@ -154,6 +171,34 @@ REQUEST_TIMEOUT = 30
 BROWSER_WORKERS = int(os.getenv('MHRA_BROWSER_WORKERS', '4'))
 
 _DOC_TYPE_ORDER = {'SPC': 0, 'PIL': 1, 'PAR': 2}
+
+# Matches the UK licence number embedded in a document's file_name, e.g.
+# "spc-doc_PLGB 00101-1041.pdf" -> ("GB", "00101", "1041") or
+# "leaflet MAH BRAND_PLPI 45763-1103.pdf" -> ("PI", "45763", "1103"). The
+# 1-2 letter suffix (GB/NI/PI, or none for the older plain "PL" prefix) is
+# just the licence *type* — the digit pair is the stable identifier MHRA
+# itself displays (e.g. "00289/2658" on a PAR card), regardless of which
+# prefix variant a given document happens to use.
+_REGISTRATION_RE = re.compile(r'PL([A-Z]{0,2})\s*(\d{4,5})[-/](\d{3,4})\b', re.IGNORECASE)
+
+
+def _extract_registration_number(file_name: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Returns (licence_type, registration_number) parsed from a document's
+    file_name, e.g. ("PLGB", "00101/1041"), or (None, None) if the file_name
+    doesn't carry a recognizable licence number (see _REGISTRATION_RE).
+    registration_number is normalized to "NNNNN/NNNN" regardless of whether
+    the source used a dash or a slash.
+    """
+    if not file_name:
+        return None, None
+    match = _REGISTRATION_RE.search(file_name)
+    if not match:
+        return None, None
+    suffix, first, second = match.groups()
+    licence_type = f"PL{suffix.upper()}"
+    registration_number = f"{first}/{second}"
+    return licence_type, registration_number
 
 _CARD_EXTRACT_JS = """
 els => els.map(el => {
@@ -398,37 +443,46 @@ class UnitedKingdomMHRACrawler:
                 return False
             logger.info(f"Used fallback search for product (on-page nav returned nothing): {link_text!r}")
 
-        name, documents = self._build_record(link_text, cards)
-        if not documents:
-            return False
+        saved_any = False
+        for registration_number, group_cards in self._group_cards_by_registration(cards):
+            name, documents = self._build_record(link_text, group_cards)
+            if not documents:
+                continue
 
-        # Dedup by product name: one row per distinct /product/?product=<name>
-        # page by design (see module docstring), and `name` is a stable,
-        # indexed column — unlike document_url (our own S3 key, freshly
-        # timestamped on every upload, never reproducible) or an individual
-        # document's source_url (works, but a slower JSONB scan for no real
-        # benefit here since a product is only ever reached under one name).
-        if check_record_exists_by_name(country_id, name):
-            return False
+            # Dedup by registration number when the group has one (stable
+            # across re-crawls, same as SFDA's registerNumber — see module
+            # docstring), else by product name for the no-registration-number
+            # fallback group — `name` is a stable, indexed column, unlike
+            # document_url (our own S3 key, freshly timestamped on every
+            # upload, never reproducible).
+            if registration_number:
+                if check_record_exists_by_json_field(country_id, 'registration_number', registration_number):
+                    continue
+            elif check_record_exists_by_name(country_id, name):
+                continue
 
-        if DOWNLOAD_DOCUMENTS:
-            self._download_all(country_id, name, documents)
+            if DOWNLOAD_DOCUMENTS:
+                self._download_all(country_id, name, documents)
 
-        # document_url is OUR storage location for each document (the bare
-        # S3 object key — never a full s3://bucket/key URI, see
-        # app.storage.upload_file), ordered SPC-first same as `documents`.
-        # A document whose download/upload failed (or DOWNLOAD_DOCUMENTS is
-        # off) simply has no s3_path and is omitted here, but its metadata
-        # (including source_url, used for dedup above) still lives in
-        # json_data.documents so nothing about it is lost.
-        s3_keys = [d['s3_path'] for d in documents if d.get('s3_path')]
+            # document_url is OUR storage location for each document (the bare
+            # S3 object key — never a full s3://bucket/key URI, see
+            # app.storage.upload_file), ordered SPC-first same as `documents`.
+            # A document whose download/upload failed (or DOWNLOAD_DOCUMENTS is
+            # off) simply has no s3_path and is omitted here, but its metadata
+            # (including source_url, used for dedup above) still lives in
+            # json_data.documents so nothing about it is lost.
+            s3_keys = [d['s3_path'] for d in documents if d.get('s3_path')]
 
-        json_data = {
-            'product_name': link_text,
-            'documents': documents,
-        }
-        save_drug_record(name, country_id, s3_keys, json_data)
-        return True
+            json_data = {
+                'product_name': link_text,
+                'documents': documents,
+            }
+            if registration_number:
+                json_data['registration_number'] = registration_number
+            save_drug_record(name, country_id, s3_keys, json_data)
+            saved_any = True
+
+        return saved_any
 
     def _accept_disclaimer_if_present(self, page):
         checkbox = page.query_selector('input#agree-checkbox')
@@ -511,6 +565,31 @@ class UnitedKingdomMHRACrawler:
         return cards
 
     # ------------------------------------------------------------------
+    # Registration-number grouping (see module docstring: one row per
+    # licence, not per product page)
+    # ------------------------------------------------------------------
+
+    def _group_cards_by_registration(self, cards: List[dict]) -> List[Tuple[Optional[str], List[dict]]]:
+        """
+        Buckets doc-cards by the registration number parsed out of each
+        card's file_name (see _extract_registration_number), preserving
+        first-seen group order. Cards with no parseable registration number
+        collect into a single None-keyed fallback group — matching the old,
+        pre-grouping behaviour — rather than being dropped or split one row
+        per card.
+        """
+        groups: Dict[Optional[str], List[dict]] = {}
+        order: List[Optional[str]] = []
+        for card in cards:
+            licence_type, registration_number = _extract_registration_number(card.get('file_name'))
+            enriched = dict(card, licence_type=licence_type, registration_number=registration_number)
+            if registration_number not in groups:
+                groups[registration_number] = []
+                order.append(registration_number)
+            groups[registration_number].append(enriched)
+        return [(key, groups[key]) for key in order]
+
+    # ------------------------------------------------------------------
     # Record assembly
     # ------------------------------------------------------------------
 
@@ -537,9 +616,15 @@ class UnitedKingdomMHRACrawler:
                 'active_substances': active_substances,
                 # The ORIGINAL MHRA blob URL — kept for provenance/download.
                 # `document_url` (the DB column) holds OUR s3_path instead,
-                # once _download_all populates it below. Dedup is by `name`
-                # (see _process_product), not this field.
+                # once _download_all populates it below. Dedup is by
+                # registration_number/name (see _process_product), not this
+                # field.
                 'source_url': href,
+                # Parsed from file_name by _group_cards_by_registration,
+                # already shared by every card in this group (that's the
+                # grouping key) — see module docstring.
+                'registration_number': c.get('registration_number'),
+                'licence_type': c.get('licence_type'),
             })
 
             if name is None and doc_type == 'SPC':
