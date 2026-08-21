@@ -44,6 +44,17 @@ No document_url
 ----------------
 This export has no attached PDF/label file per record, so document_url is
 always empty here.
+
+packaging_barcode is currently always empty
+---------------------------------------------
+`包裝與國際條碼` ("packaging and international barcode") is a real column in
+the schema, but confirmed live (2026-08-21, full scan of all 72,013 rows)
+it is null on every single row. `包裝` ("packaging") is populated on ~93%
+of rows but only ever holds a container-type descriptor (e.g. 瓶裝
+"bottled", 管裝 "tube", 安瓿 "ampoule") — not a pack size or barcode value.
+So there is no actual barcode data obtainable from this source today; we
+still map both fields through in case TFDA starts populating the barcode
+column later.
 """
 
 from __future__ import annotations
