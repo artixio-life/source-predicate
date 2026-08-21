@@ -443,6 +443,55 @@ old implementation if needed.
 - No attached PDF/label on this endpoint either, so `document_url` is
   always empty — same as the South Africa crawler.
 
+## Thailand Crawler — FDA Public Pharmaceutical Regulatory Information Portal
+
+`app/crawlers/thailand/crawler_th_1.py` crawls
+`porta.fda.moph.go.th` / `pertento.fda.moph.go.th`, the Thai FDA's public
+product-search portal. Unlike every other crawler in this repo, the source
+has **no "list everything" endpoint at all** — its Angular search UI enforces
+a 4-character minimum on every query, matched against product name/license
+number/company name.
+
+- **Search**: `POST FDA_SEARCH_CENTER_BACKEND/SEACH_ALL/GET_SEARCH`, a
+  multipart body with a JSON `MODEL` filter object + `search_input`. The
+  filter reproduces the site's own "Search by product" > "Medication"
+  checkbox combination (`RADIO_TYPE` = "search by product",
+  `RADIO_TYPE_ETC_DRUG` = "Y") — confirmed live against the exact filter
+  state shown in the site's own UI. Returns a bare JSON array of result rows,
+  each carrying a `Newcode` (the id needed for the detail fetch).
+- **No full-coverage query exists**, so the crawler brute-forces every
+  4-letter combination (`TH_FDA_ALPHABET` / `TH_FDA_COMBO_LENGTH`, default
+  a-z ⇒ 456,976 terms) as the search term, relying on the API's substring
+  match across several fields to eventually surface every product. Overlap
+  between search terms (the same product found under multiple substrings) is
+  deduplicated both in-process and against the database by `Newcode`, so it
+  costs redundant requests but never a duplicate row. This is inherently a
+  very large number of requests — tune `TH_FDA_SEARCH_WORKERS` /
+  `TH_FDA_MAX_COMBOS` for pacing and testing.
+- **Detail**: `POST FDA_INFORMATION_DRUG/SV_CENTER/GET_PHAR_PRODUCT_INFO?Newcode=<code>`.
+  Confirmed live this rejects requests with no `Referer`/`Origin`/
+  `X-Requested-With` headers (`{"MSG_CODE": "403", "MSG_RESULT": "ERROR"}`) —
+  sending them matching a normal browser session on that host returns the
+  FULL structured product record: registration number, approval/expiry/
+  cancellation dates, both trade names, dose form, legislation class,
+  indication text, active-ingredient formula, ATC classification,
+  manufacturer/repacker/release-site details (each with its role), and
+  licensee/establishment address. Some `Newcode` values returned by search
+  contain stray non-ASCII (Thai) characters — a data-quality quirk on the
+  source's side — so the crawler percent-encodes them before use; those
+  particular codes simply come back as an all-null "not found" record and
+  are skipped.
+- **No attached PDF/label** on this endpoint — `DOCUMENT_FILE`, `REPORT_FILE`,
+  and the `PICTURE_FLIE_*` fields are always empty arrays, confirmed across
+  both active and revoked products. `document_url` is therefore always empty,
+  same as the Saudi Arabia and South Africa crawlers. Verified against a
+  manually "printed to PDF" product page: every field the printed page shows
+  is present in the detail JSON, and the JSON is strictly richer (e.g. it
+  exposes each manufacturer's role, where the printed page just repeats a
+  flat table).
+- Dedup: `json_data.newcode` via
+  `check_record_exists_by_json_field(country_id, 'newcode', ...)`.
+
 ## Crawler Interface
 
 Every crawler class registered in `app/crawlers/<country>/__init__.py` must implement:
