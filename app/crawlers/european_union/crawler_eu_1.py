@@ -174,24 +174,37 @@ class EuropeanUnionMedicineExcelCrawler:
             time.sleep(REQUEST_DELAY - elapsed)
         self._last_request_at = time.monotonic()
 
-    def _find_product_information_pdf(self, medicine_url: str) -> Optional[str]:
-        """Return only the English Product information PDF URL, if present."""
+    @staticmethod
+    def _find_english_pdf(section) -> Optional[str]:
+        for link in section.select('a[href]'):
+            href = link.get('href', '').strip()
+            if href.lower().endswith('_en.pdf'):
+                return href
+        return None
+
+    def _find_document_pdf(self, medicine_url: str) -> Tuple[Optional[str], Optional[str]]:
+        """Return the English Product information PDF URL if present, otherwise the
+        first available English PDF on the page (in document order), along with the
+        EMA document type it was found under."""
         self._throttle()
         response = self._session.get(medicine_url, timeout=PAGE_TIMEOUT)
         response.raise_for_status()
         soup = BeautifulSoup(response.text, 'lxml')
-        section = soup.select_one('[data-ema-document-type="product-information"]')
-        if not section:
-            return None
 
-        for link in section.select('a[href]'):
-            href = urljoin(medicine_url, link.get('href', '').strip())
-            if (
-                href.lower().endswith('_en.pdf')
-                and '/documents/product-information/' in href.lower()
-            ):
-                return href
-        return None
+        pi_section = soup.select_one('[data-ema-document-type="product-information"]')
+        if pi_section:
+            href = self._find_english_pdf(pi_section)
+            if href:
+                return urljoin(medicine_url, href), 'product_information'
+
+        for section in soup.select('[data-ema-document-type]'):
+            document_type = section.get('data-ema-document-type')
+            if document_type == 'product-information':
+                continue
+            href = self._find_english_pdf(section)
+            if href:
+                return urljoin(medicine_url, href), document_type
+        return None, None
 
     def _download_product_information(
         self,
@@ -203,13 +216,18 @@ class EuropeanUnionMedicineExcelCrawler:
             return None, []
 
         try:
-            pdf_url = self._find_product_information_pdf(medicine_url)
+            pdf_url, document_type = self._find_document_pdf(medicine_url)
         except requests.RequestException as exc:
             logger.warning('EMA medicine page failed for %s: %s', medicine_url, exc)
             return None, []
         if not pdf_url:
-            logger.info('No English Product information PDF found for %s', medicine_name)
+            logger.info('No English PDF document found for %s', medicine_name)
             return None, []
+        if document_type != 'product_information':
+            logger.info(
+                'No Product information PDF for %s; falling back to %s document',
+                medicine_name, document_type,
+            )
 
         content = None
         content_type = ''
@@ -260,7 +278,7 @@ class EuropeanUnionMedicineExcelCrawler:
         key = build_document_key(f'european_union/{country_id}', medicine_name, '.pdf')
         s3_path = upload_file(content, key, content_type_for_ext('.pdf'))
         return s3_path, [{
-            'document_type': 'product_information',
+            'document_type': document_type,
             'language': 'en',
             'source_url': pdf_url,
             's3_path': s3_path,
